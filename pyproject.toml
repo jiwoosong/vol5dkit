@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vol5dkit"
+version = "0.0.0.1"
+description = "Lightweight TCSHW tensor geometry and native-slice volume comparison"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Jiwoo Song"}]
+keywords = ["pytorch", "volume", "voxel", "visualization", "cuda"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = ["torch>=2.3", "numpy>=1.26"]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.8,<7", "vispy>=0.17,<0.18", "PyOpenGL>=3.1.7"]
+test = ["pytest>=8"]
+dev = ["pytest>=8", "build>=1.2", "twine>=6"]
+
+[project.urls]
+Repository = "https://github.com/jiwoosong/vol5dkit"
+Issues = "https://github.com/jiwoosong/vol5dkit/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "cuda: requires a CUDA-enabled PyTorch runtime and GPU",
+    "gui: requires GUI dependencies and VOL5DKIT_TEST_GUI=1 with a display",
+    "voltensor: requires the separately installed reference VolTensor library",
+]
