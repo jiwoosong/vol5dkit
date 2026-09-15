@@ -72,7 +72,11 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[gui,test]"
       - name: Run tests with a real software OpenGL context
-        run: xvfb-run -a -s "-screen 0 1280x1024x24 +extension GLX" python -m pytest -q
+        run: |
+          plugin=$(python -c 'from PySide6.QtCore import QLibraryInfo; print(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))')/platforms/libqxcb.so
+          ldd "$plugin"
+          xvfb-run -a -s "-screen 0 1280x1024x24 +extension GLX" python -c 'from PySide6.QtWidgets import QApplication; app = QApplication([]); print("Qt application initialized")'
+          xvfb-run -a -s "-screen 0 1280x1024x24 +extension GLX" python -m pytest -q
 
   distributions:
     name: Wheel and source distribution
