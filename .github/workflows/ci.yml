@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+            torch: "torch==2.3.1"
+            numpy: "numpy==1.26.4"
+          - os: ubuntu-latest
+            python: "3.11"
+            torch: "torch"
+            numpy: "numpy"
+          - os: windows-latest
+            python: "3.11"
+            torch: "torch"
+            numpy: "numpy"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install CPU test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "${{ matrix.numpy }}"
+          python -m pip install -e ".[test]"
+      - name: Test core, display data, packaging, and optional adapter
+        run: python -m pytest -q tests/test_volume.py tests/test_viewer_data.py tests/test_voltensor.py tests/test_packaging.py
+
+  gui:
+    name: GUI (Xvfb and Mesa)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VOL5DKIT_TEST_GUI: "1"
+      QT_QPA_PLATFORM: xcb
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install X11 and OpenGL runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libegl1 libgl1 libopengl0 mesa-utils libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
+      - name: Install GUI test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[gui,test]"
+      - name: Run tests with a real software OpenGL context
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 +extension GLX" python -m pytest -q
+
+  distributions:
+    name: Wheel and source distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build and validate distributions
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
