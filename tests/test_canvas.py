@@ -13,7 +13,72 @@ pytest.importorskip("PySide6")
 
 from vol5dkit import Volume
 from vol5dkit.viewer._data import Request, make_source, prepare_frame
-from vol5dkit.viewer.canvas import PLANE_AXES, VolumeCanvas, plane_transform, volume_transform
+from vol5dkit.viewer.canvas import (
+    PLANE_AXES, VolumeCanvas, _sample_colormap, available_colormaps,
+    plane_transform, volume_transform,
+)
+
+
+def test_all_builtin_colormaps_have_provider_ids_and_finite_rgba():
+    choices = available_colormaps()
+    assert ("vispy:grays", "grays · VisPy") in choices
+    samples = np.linspace(0, 1, 256)
+    for name, _ in choices:
+        colors = _sample_colormap(name, samples)
+        assert colors.shape == (256, 4)
+        assert np.isfinite(colors).all()
+        np.testing.assert_array_equal(colors, _sample_colormap(name.removeprefix("vispy:"), samples))
+
+
+def test_missing_optional_palette_libraries_keep_builtin_choices(monkeypatch):
+    from vol5dkit.viewer import canvas as module
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    assert available_colormaps(extended=True) == available_colormaps()
+
+
+def test_broken_installed_palette_library_reports_its_error(monkeypatch):
+    from vol5dkit.viewer import canvas as module
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: object())
+
+    def broken(name):
+        raise ImportError("installed library has a missing dependency")
+
+    monkeypatch.setattr(module.importlib, "import_module", broken)
+    with pytest.raises(ImportError, match="missing dependency"):
+        available_colormaps(extended=True)
+    assert available_colormaps()  # Basic choices do not import extras.
+
+
+def test_matplotlib_colors_use_requested_provider_and_bare_names():
+    mpl = pytest.importorskip("matplotlib")
+    samples = np.linspace(0, 1, 256)
+    colors = _sample_colormap("mpl:hot", samples)
+    np.testing.assert_array_equal(colors, mpl.colormaps["hot"](samples))
+    assert not np.allclose(colors, _sample_colormap("vispy:hot", samples))
+    np.testing.assert_array_equal(_sample_colormap("plasma", samples), mpl.colormaps["plasma"](samples))
+    choices = dict(available_colormaps(extended=True))
+    assert choices["mpl:hot"] == "hot · Matplotlib"
+
+
+def test_seaborn_named_continuous_maps_and_reverses_match_provider():
+    sns = pytest.importorskip("seaborn")
+    samples = np.linspace(0, 1, 256)
+    choices = dict(available_colormaps(extended=True))
+    for name in ("rocket", "mako", "icefire", "vlag", "flare", "crest"):
+        for suffix in ("", "_r"):
+            key = name + suffix
+            assert f"sns:{key}" in choices
+            np.testing.assert_array_equal(
+                _sample_colormap(f"sns:{key}", samples), sns.color_palette(key, as_cmap=True)(samples),
+            )
+    with pytest.raises(ValueError, match="continuous Seaborn"):
+        _sample_colormap("sns:deep", samples)
+
+
+@pytest.mark.parametrize("name", ["other:hot", "vispy:does-not-exist"])
+def test_invalid_colormap_provider_or_name(name):
+    with pytest.raises(ValueError):
+        _sample_colormap(name, np.linspace(0, 1, 256))
 
 
 def test_image_centers_match_world_coordinates():
@@ -30,21 +95,27 @@ def test_image_centers_match_world_coordinates():
             np.testing.assert_allclose(result, volume.index_to_world(shw), atol=1e-6)
 
 
-def test_volume_preview_preserves_first_center_and_strided_spacing():
+def test_volume_transform_preserves_native_voxel_centers():
     volume = Volume(torch.empty(1, 1, 6, 7, 8), spacing=(3, 2, 1), origin=(7, 11, 13))
-    transform = volume_transform(volume, stride=3)
+    transform = volume_transform(volume)
     np.testing.assert_allclose(transform.map((0, 0, 0))[:3], volume.origin)
-    np.testing.assert_allclose(transform.map((2, 1, 1))[:3], volume.index_to_world((3, 3, 6)))
+    np.testing.assert_allclose(transform.map((2, 1, 1))[:3], volume.index_to_world((1, 1, 2)))
+
+
+@pytest.fixture(scope="session")
+def application():
+    if os.environ.get("VOL5DKIT_TEST_GUI") != "1":
+        pytest.skip("set VOL5DKIT_TEST_GUI=1 to run actual OpenGL rendering")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
 
 
 @pytest.fixture
-def canvas():
+def canvas(application):
     if os.environ.get("VOL5DKIT_TEST_GUI") != "1":
         pytest.skip("set VOL5DKIT_TEST_GUI=1 to run actual OpenGL rendering")
     from PySide6 import QtCore
     from PySide6.QtWidgets import QWidget, QVBoxLayout
-    from vol5dkit.viewer.window import _app
-    application = _app()
     # Match production: an embedded QOpenGLWidget, with an application whose
     # lifetime outlasts every canvas. Delete closed Qt contexts before another
     # test renders, instead of leaving their destruction to Python's GC.
@@ -64,8 +135,8 @@ def canvas():
     application.processEvents()
 
 
-def _frame(tensor, *, rgb=False, volume_3d=False, preview_stride=1):
-    return prepare_frame(Request(1, "A", make_source(Volume(tensor), rgb), (0, 0, 0, 0), clim=(0, 1), volume_3d=volume_3d, preview_stride=preview_stride))
+def _frame(tensor, *, rgb=False, volume_3d=False):
+    return prepare_frame(Request(1, 0, make_source(Volume(tensor), rgb), (0, 0, 0, 0), window=(0, 1), volume_3d=volume_3d))
 
 
 def _sample(canvas, screenshot, name, column, row):
@@ -88,6 +159,65 @@ def test_nearest_and_explicit_linear_rendering(canvas):
     linear = canvas.render()
     pixel = _sample(canvas, linear, "HW", 0.75, 0.5)
     assert np.all((pixel > 40) & (pixel < 90)), pixel
+
+
+@pytest.mark.gui
+def test_all_colormaps_render_native_planes_and_scalar_volume(canvas):
+    from vispy.color import get_colormap
+    frame = _frame(torch.full((1, 1, 4, 4, 4), 0.5), volume_3d=True)
+    canvas.set_frame(frame)
+    for name in ("grays", "viridis", "hot", "coolwarm", "fire"):
+        canvas.set_colormap(name)
+        canvas.set_3d_mode("slices")
+        screenshot = canvas.render()
+        expected = get_colormap(name)[0.5].rgba[0, :3] * 255
+        np.testing.assert_allclose(_sample(canvas, screenshot, "HW", 1.5, 1.5), expected, atol=2)
+        assert all(image.visible for image in canvas._cutplanes.values())
+        canvas.set_3d_mode("volume")
+        assert canvas._volume_visual.visible
+        assert canvas.render().shape[-1] == 4
+        alpha = canvas._volume_visual.cmap.colors.rgba[:, 3]
+        np.testing.assert_allclose(alpha, np.linspace(0, canvas._opacity, len(alpha)), atol=1e-7)
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("name,dependency", [("mpl:hot", "matplotlib"), ("sns:rocket", "seaborn")])
+def test_optional_colormaps_render_planes_and_volume(canvas, name, dependency):
+    pytest.importorskip(dependency)
+    frame = _frame(torch.full((1, 1, 4, 4, 4), 0.5), volume_3d=True)
+    canvas.set_frame(frame)
+    canvas.set_colormap(name)
+    for mode in ("slices", "volume"):
+        canvas.set_3d_mode(mode)
+        screenshot = canvas.render()
+        # The display intentionally samples each provider into a 256-color LUT.
+        expected = _sample_colormap(name, np.array([0.5]))[0, :3] * 255
+        np.testing.assert_allclose(_sample(canvas, screenshot, "HW", 1.5, 1.5), expected, atol=2)
+        assert canvas._volume_visual.visible == (mode == "volume")
+
+
+@pytest.mark.gui
+def test_failed_colormap_preparation_leaves_all_visuals_unchanged(canvas, monkeypatch):
+    canvas.set_frame(_frame(torch.full((1, 1, 4, 4, 4), 0.5), volume_3d=True), mode_3d="volume")
+    before = canvas.render()
+    maps = [image.cmap for image in (*canvas._images.values(), *canvas._cutplanes.values(), canvas._volume_visual)]
+    from vol5dkit.viewer import canvas as module
+    colormap = module.Colormap
+    calls = 0
+
+    def fail_volume(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("broken volume colormap")
+        return colormap(*args, **kwargs)
+
+    monkeypatch.setattr(module, "Colormap", fail_volume)
+    with pytest.raises(ValueError, match="broken volume"):
+        canvas.set_colormap("hot")
+    assert canvas.colormap == "grays"
+    assert maps == [image.cmap for image in (*canvas._images.values(), *canvas._cutplanes.values(), canvas._volume_visual)]
+    np.testing.assert_array_equal(canvas.render(), before)
 
 
 @pytest.mark.gui
@@ -139,7 +269,7 @@ def test_rgb_volume_modes_and_repeated_relative_zoom(canvas):
         canvas.set_frame(first)
     np.testing.assert_allclose(camera.rect.pos, before.pos)
     np.testing.assert_allclose(camera.rect.size, before.size)
-    canvas.set_frame(_frame(torch.rand(1, 1, 8, 8, 8), volume_3d=True, preview_stride=2), mode_3d="volume")
+    canvas.set_frame(_frame(torch.rand(1, 1, 8, 8, 8), volume_3d=True), mode_3d="volume")
     assert canvas.render().shape[-1] == 4
     assert canvas._volume_visual.visible
     canvas.set_frame(_frame(torch.rand(1, 3, 4, 4, 4), rgb=True))
@@ -247,9 +377,9 @@ def test_wheel_navigates_without_zoom_and_ctrl_wheel_zooms(canvas):
     _mouse(canvas, "mouse_wheel", pos, delta=(0, 1), modifiers=(keys.CONTROL,))
     assert len(scrolled) == 2
     assert camera.rect.width < before.width
-    # A partial wheel tick belongs to its source/slot, not the next A/B input.
+    # A partial wheel tick belongs to the displayed input.
     _mouse(canvas, "mouse_wheel", pos, delta=(0, 0.5))
-    canvas.set_frame(replace(frame, slot="B"))
+    canvas.set_frame(replace(frame, input_index=1))
     _mouse(canvas, "mouse_wheel", pos, delta=(0, 0.5))
     assert len(scrolled) == 2
     # Navigation also works over the panel's background outside image bounds.
@@ -262,7 +392,7 @@ def test_wheel_navigates_without_zoom_and_ctrl_wheel_zooms(canvas):
 @pytest.mark.gui
 def test_crosshair_geometry_has_native_voxel_gap_and_can_hide(canvas):
     volume = Volume(torch.zeros(1, 1, 5, 7, 9), spacing=(3, 2, 0.5))
-    frame = prepare_frame(Request(1, "A", make_source(volume), (0, 0.5, 0.5, 0.5), clim=(0, 1)))
+    frame = prepare_frame(Request(1, 0, make_source(volume), (0, 0.5, 0.5, 0.5), window=(0, 1)))
     canvas.set_crosshair_visible(True)
     canvas.set_frame(frame)
     for name, (row, col, _) in PLANE_AXES.items():
@@ -278,3 +408,28 @@ def test_crosshair_geometry_has_native_voxel_gap_and_can_hide(canvas):
     canvas.set_crosshair_visible(False)
     canvas.set_frame(frame)
     assert not any(line.visible for line in canvas._crosshairs.values())
+
+
+@pytest.mark.gui
+def test_prepared_palette_samples_once_and_shares_all_image_maps(canvas, monkeypatch):
+    from vol5dkit.viewer import canvas as module
+    sample = module._sample_colormap
+    calls = []
+
+    def record(name, samples):
+        calls.append(name)
+        return sample(name, samples)
+
+    monkeypatch.setattr(module, "_sample_colormap", record)
+    palette = canvas.prepare_colormap("fire")
+    frame = _frame(torch.full((1, 1, 4, 4, 4), 0.5), volume_3d=True)
+    canvas.set_frame(frame, mode_3d="volume", palette=palette)
+    assert calls == ["fire"]
+    assert all(image.cmap is palette.scalar for image in (*canvas._images.values(), *canvas._cutplanes.values()))
+    assert canvas._volume_visual.cmap is palette.volume
+    canvas.set_opacity(0.3)
+    adjusted = canvas.palette
+    canvas.set_frame(frame, mode_3d="volume", opacity=0.3, palette=palette)
+    assert canvas.palette is adjusted
+    assert calls == ["fire"]
+    assert canvas._volume_visual._last_data is frame.volume_buffer

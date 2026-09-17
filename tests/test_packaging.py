@@ -43,13 +43,15 @@ import sys
 import torch
 import vol5dkit
 import vol5dkit.viewer._data
+options = vol5dkit.Display(torch.zeros(1, 1, 1, 1, 1), name="test", window=(0, 1))
 
 assert Path(vol5dkit.__file__).resolve() == Path(sys.argv[1]).resolve()
 for name in ('voltensor', 'SimpleITK', 'nibabel', 'monai', 'nrrd', 'torchio',
-             'PySide6', 'vispy', 'OpenGL'):
+             'PySide6', 'vispy', 'OpenGL', 'matplotlib', 'seaborn'):
     assert name not in sys.modules, name
 assert not torch.cuda.is_initialized()
-assert callable(vol5dkit.view) and callable(vol5dkit.run)
+assert callable(vol5dkit.view) and options.window == (0, 1)
+assert not hasattr(vol5dkit, 'run')
 """
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")

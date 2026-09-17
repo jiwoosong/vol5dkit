@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+import importlib
+import importlib.util
 import itertools
 
 import numpy as np
 from vispy import app, scene
-from vispy.color import Colormap, get_colormap
+from vispy.color import Colormap, get_colormap, get_colormaps
 from vispy.geometry import Rect
 from vispy.util import keys
 from vispy.visuals.transforms import MatrixTransform, STTransform
@@ -14,6 +17,54 @@ from vispy.visuals.transforms import MatrixTransform, STTransform
 
 # (row, column, fixed) in SHW order; ImageVisual's local axes are (column, row).
 PLANE_AXES = {"HW": (1, 2, 0), "SW": (0, 2, 1), "SH": (0, 1, 2)}
+
+_SEABORN_COLORMAPS = ("rocket", "mako", "icefire", "vlag", "flare", "crest")
+
+
+def available_colormaps(extended=False):
+    """Return (provider-qualified name, display label), loading extras on demand.
+
+    An absent extra is skipped. A broken installed library raises instead of
+    silently hiding its installation error; the caller can retain its list.
+    """
+    result = [(f"vispy:{name}", f"{name} · VisPy") for name in get_colormaps()]
+    if extended:
+        if importlib.util.find_spec("matplotlib") is not None:
+            mpl = importlib.import_module("matplotlib")
+            result.extend((f"mpl:{name}", f"{name} · Matplotlib") for name in mpl.colormaps)
+        if importlib.util.find_spec("seaborn") is not None:
+            importlib.import_module("seaborn")
+            result.extend(
+                (f"sns:{name}{suffix}", f"{name}{suffix} · Seaborn")
+                for name in _SEABORN_COLORMAPS for suffix in ("", "_r")
+            )
+    return result
+
+
+def _sample_colormap(name, samples):
+    """Sample the named provider directly; never substitute a namesake map."""
+    provider, separator, key = name.partition(":")
+    if not separator:
+        key = name
+        provider = "vispy" if name in get_colormaps() else "mpl"
+    if provider == "vispy":
+        if key not in get_colormaps():
+            raise ValueError(f"unknown VisPy colormap: {key!r}")
+        # Public lookup supplies column-shaped samples for analytic maps such
+        # as hot/fire, whose map() methods cannot accept a 1D sample array.
+        colors = get_colormap(key)[samples].rgba
+    elif provider == "mpl":
+        mpl = importlib.import_module("matplotlib")
+        colors = mpl.colormaps[key](samples)
+    elif provider == "sns":
+        base = key[:-2] if key.endswith("_r") else key
+        if base not in _SEABORN_COLORMAPS:
+            raise ValueError(f"unknown continuous Seaborn colormap: {key!r}")
+        sns = importlib.import_module("seaborn")
+        colors = sns.color_palette(key, as_cmap=True)(samples)
+    else:
+        raise ValueError("colormap provider must be 'vispy', 'mpl', or 'sns'")
+    return np.array(colors, copy=True)
 
 
 def plane_transform(volume, name, indices):
@@ -31,12 +82,20 @@ def plane_transform(volume, name, indices):
     return MatrixTransform(matrix.T)
 
 
-def volume_transform(volume, stride=1):
+def volume_transform(volume):
     """VisPy VolumeVisual already centers its first voxel at index zero."""
     matrix = np.eye(4)
-    matrix[:3, :3] = np.asarray(volume.direction) * np.asarray(volume.spacing)[::-1] * stride
+    matrix[:3, :3] = np.asarray(volume.direction) * np.asarray(volume.spacing)[::-1]
     matrix[:3, 3] = volume.origin
     return MatrixTransform(matrix.T)
+
+
+@dataclass(frozen=True, slots=True)
+class _Palette:
+    name: str
+    scalar: Colormap
+    volume: Colormap
+    opacity: float
 
 
 class VolumeCanvas:
@@ -65,7 +124,7 @@ class VolumeCanvas:
         self._interpolation = "nearest"
         self._mode_3d = "slices"
         self._opacity = 0.15
-        self._colormap = "grays"
+        self._palette = self.prepare_colormap("grays")
         self._rgb = None
         self._images = {}
         self._cutplanes = {}
@@ -131,7 +190,7 @@ class VolumeCanvas:
                     # VisPy expands the 'r' prefix to 'rgb' for HWC data.
                     texture_format="r32f",
                     interpolation=self._interpolation,
-                    cmap=self._make_colormap(),
+                    cmap=self._palette.scalar,
                 )
                 image.set_gl_state(
                     "opaque", depth_test=depth, cull_face=False,
@@ -139,26 +198,49 @@ class VolumeCanvas:
                 target[name] = image
         self._rgb = rgb
 
-    def _make_colormap(self, volume=False):
-        samples = np.linspace(0, 1, 256)
-        colors = np.array(get_colormap(self._colormap).map(samples), copy=True)
-        colors[:, 3] = samples * self._opacity if volume else 1.0
-        return Colormap(colors, bad_color=(1, 0, 1, self._opacity if volume else 1))
+    @property
+    def palette(self):
+        """Prepared scalar/volume maps currently displayed by the canvas."""
+        return self._palette
 
-    def set_colormap(self, name):
-        """Set the scalar colormap; RGB data are displayed directly."""
-        get_colormap(name)  # Validate before changing state.
-        self._colormap = name
+    @property
+    def colormap(self):
+        return self._palette.name
+
+    def prepare_colormap(self, name):
+        """Sample a provider once and validate both maps without changing pixels."""
+        samples = np.linspace(0, 1, 256)
+        colors = _sample_colormap(name, samples)
+        colors[:, 3] = 1.0
+        scalar = Colormap(colors.copy(), bad_color=(1, 0, 1, 1))
+        colors[:, 3] = samples * self._opacity
+        volume = Colormap(colors, bad_color=(1, 0, 1, self._opacity))
+        return _Palette(name, scalar, volume, self._opacity)
+
+    def set_colormap(self, value):
+        """Apply a name or an already prepared palette to every scalar visual."""
+        palette = self.prepare_colormap(value) if isinstance(value, str) else value
+        if palette.opacity != self._opacity:
+            palette = self._palette_opacity(palette, self._opacity)
         for image in (*self._images.values(), *self._cutplanes.values()):
-            image.cmap = self._make_colormap()
+            image.cmap = palette.scalar
         if self._volume_visual is not None:
-            self._volume_visual.cmap = self._make_colormap(volume=True)
+            self._volume_visual.cmap = palette.volume
+        self._palette = palette
         self._canvas.update()
+
+    @staticmethod
+    def _palette_opacity(palette, opacity):
+        colors = palette.scalar.colors.rgba.copy()
+        colors[:, 3] = np.linspace(0, opacity, len(colors))
+        return replace(palette, volume=Colormap(colors, bad_color=(1, 0, 1, opacity)), opacity=opacity)
 
     def set_interpolation(self, value):
         """Change display sampling without modifying or resampling source data."""
         if value not in ("nearest", "linear"):
             raise ValueError("interpolation must be 'nearest' or 'linear'")
+        if value == self._interpolation:
+            return
         self._interpolation = value
         for image in (*self._images.values(), *self._cutplanes.values()):
             image.interpolation = value
@@ -184,9 +266,11 @@ class VolumeCanvas:
             raise ValueError("opacity must be between 0 and 1")
         if self._opacity == value:
             return
-        self._opacity = value
+        palette = self._palette_opacity(self._palette, value)
         if self._volume_visual is not None:
-            self._volume_visual.cmap = self._make_colormap(volume=True)
+            self._volume_visual.cmap = palette.volume
+        self._palette = palette
+        self._opacity = value
         self._canvas.update()
 
     def set_crosshair_visible(self, value):
@@ -196,12 +280,14 @@ class VolumeCanvas:
             crosshair.visible = self._crosshair_visible
         self._canvas.update()
 
-    def set_frame(self, frame, *, interpolation="nearest", mode_3d="slices", opacity=0.15):
+    def set_frame(self, frame, *, interpolation="nearest", mode_3d="slices", opacity=0.15, palette=None):
         """Replace image content and labels atomically on the GUI thread."""
         self.set_interpolation(interpolation)
         self.set_opacity(opacity)
+        if palette is not None and palette.scalar is not self._palette.scalar:
+            self.set_colormap(palette)
         volume = frame.source.volume
-        if self._frame is None or self._frame.source is not frame.source or self._frame.slot != frame.slot:
+        if self._frame is None or self._frame.source is not frame.source or self._frame.input_index != frame.input_index:
             self._scroll_remainders = dict.fromkeys(PLANE_AXES, 0.0)
         if self._rgb != frame.source.rgb:
             self._make_images(frame.source.rgb)
@@ -251,22 +337,22 @@ class VolumeCanvas:
             fixed_name = "SHW"[fixed]
             self._labels[plane.name].text = f"{plane.name} · {fixed_name}={frame.indices[2 + fixed]}"
         self._update_world_bounds(volume)
-        if frame.volume is not None:
+        if frame.volume_buffer is not None:
             if self._volume_visual is None:
                 self._volume_visual = scene.visuals.Volume(
-                    frame.volume, parent=self._view3d.scene, clim=(0, 1),
+                    frame.volume_buffer, parent=self._view3d.scene, clim=(0, 1),
                     method="translucent", texture_format="r32f",
                     interpolation=self._interpolation,
-                    cmap=self._make_colormap(volume=True),
+                    cmap=self._palette.volume,
                 )
-            elif self._volume_data is not frame.volume:
-                self._volume_visual.set_data(frame.volume, clim=(0, 1), copy=False)
-            self._volume_visual.transform = volume_transform(volume, frame.preview_stride)
+            elif self._volume_data is not frame.volume_buffer:
+                self._volume_visual.set_data(frame.volume_buffer, clim=(0, 1), copy=False)
+            self._volume_visual.transform = volume_transform(volume)
         elif self._volume_visual is not None and self._volume_data is not None:
             # Release the full-volume CPU/GPU allocation when returning to slices.
             self._volume_visual.parent = None
             self._volume_visual = None
-        self._volume_data = frame.volume
+        self._volume_data = frame.volume_buffer
         self._frame = frame
         self.set_3d_mode(mode_3d)
         self._canvas.update()
@@ -331,7 +417,7 @@ class VolumeCanvas:
             event.handled = event.blocked = True
         elif not event.modifiers:
             event.handled = event.blocked = True
-            self._selection = (name, self._frame.source, self._frame.slot)
+            self._selection = (name, self._frame.source, self._frame.input_index)
             self._select_at(event)
 
     def _mouse_move(self, event):
@@ -361,8 +447,8 @@ class VolumeCanvas:
         self._selection = self._pan = None
 
     def _select_at(self, event):
-        name, source, slot = self._selection
-        if self._frame is None or self._frame.source is not source or self._frame.slot != slot:
+        name, source, input_index = self._selection
+        if self._frame is None or self._frame.source is not source or self._frame.input_index != input_index:
             return
         position = self._cursor_position(event)
         if position is not None and position[0] == name and self._on_pick is not None:

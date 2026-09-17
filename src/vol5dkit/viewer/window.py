@@ -12,48 +12,38 @@ if any(name in sys.modules for name in ("PyQt5", "PyQt6", "PySide2")):
 
 from PySide6 import QtCore, QtWidgets
 
+from .._view import Display, _validate_window
 from ._data import Request, make_source, prepare_frame, relative_index
-from .canvas import PLANE_AXES, VolumeCanvas
-
-
-_application = None
-_viewers = set()
-_loop_running = False
-
-
-def _main_thread():
-    if threading.current_thread() is not threading.main_thread():
-        raise RuntimeError("Create and update viewers on the Python main thread")
-
-
-def _app():
-    global _application
-    _main_thread()
-    application = QtWidgets.QApplication.instance()
-    if application is None:
-        _application = QtWidgets.QApplication([])
-        application = _application
-        application.setApplicationName("vol5dkit")
-    if not isinstance(application, QtWidgets.QApplication):
-        raise RuntimeError("The existing Qt application does not support widgets")
-    return application
-
-
-def _limits(clim):
-    if clim is None:
-        return None
-    if len(clim) != 2 or not all(math.isfinite(v) for v in clim) or clim[0] > clim[1]:
-        raise ValueError("clim must contain finite (low, high) values with low <= high")
-    return tuple(clim)
+from .canvas import PLANE_AXES, VolumeCanvas, available_colormaps
 
 
 class _Worker(QtCore.QObject):
     finished = QtCore.Signal(int, object, str)
 
+    def __init__(self):
+        super().__init__()
+        self._volume_key = None
+        self._volume_buffer = None
+
+    def clear_volume(self):
+        self._volume_key = self._volume_buffer = None
+
     @QtCore.Slot(object)
     def prepare(self, request):
         try:
-            frame = prepare_frame(request)
+            key = None
+            if request.volume_3d and not request.source.rgb:
+                key = (
+                    request.input_index, request.source.volume,
+                    relative_index(request.positions[0], request.source.volume.shape[0]),
+                    request.channel, request.window,
+                )
+            if key is None or key != self._volume_key:
+                self.clear_volume()
+            frame = prepare_frame(request, volume_buffer=self._volume_buffer)
+            if frame.volume_buffer is not None:
+                self._volume_key = (*key[:-1], frame.window)
+                self._volume_buffer = frame.volume_buffer
         except Exception as exc:
             # Do not send tracebacks retaining temporary tensor storage to Qt.
             self.finished.emit(request.revision, None, f"{type(exc).__name__}: {exc}")
@@ -61,39 +51,66 @@ class _Worker(QtCore.QObject):
             self.finished.emit(request.revision, frame, "")
 
 
+class _ColormapBox(QtWidgets.QComboBox):
+    """Load optional providers only when the picker is first opened."""
+
+    opening = QtCore.Signal()
+
+    def showPopup(self):
+        self.opening.emit()
+        super().showPopup()
+
+
 class Viewer(QtWidgets.QMainWindow):
-    """A/B volume viewer. All public methods run on the main thread.
+    """The child process's native-grid snapshot window.
 
     ``frame`` is the last completely displayed snapshot; ``last_error`` is a
-    preparation error string, or None. Registration shares detached storage:
-    do not write into it concurrently with this viewer's reads.
+    preparation/display error string, or None. Inputs are immutable CPU snapshots
+    loaded by the child entry point, which also owns the QApplication.
     """
 
     _prepare = QtCore.Signal(object)
 
-    def __init__(self, a, b=None, *, rgb=False, interpolation="nearest", clim=None):
-        _app()
+    def __init__(self, inputs, *, window=None, interpolation="nearest"):
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("Create viewers on the Python main thread")
+        if not isinstance(QtWidgets.QApplication.instance(), QtWidgets.QApplication):
+            raise RuntimeError("Create a QApplication before the snapshot viewer")
         if interpolation not in ("nearest", "linear"):
             raise ValueError("interpolation must be 'nearest' or 'linear'")
-        sources = {"A": make_source(a, rgb)}
-        if b is not None:
-            sources["B"] = make_source(b, rgb)
-        limits = _limits(clim)
+        if not inputs:
+            raise ValueError("at least one input is required")
+        sources, names, windows, colormaps = {}, {}, {}, {}
+        for input_index, display in enumerate(inputs):
+            if not isinstance(display, Display):
+                raise TypeError("viewer inputs must be normalized Display objects")
+            sources[input_index] = make_source(display.data, display.rgb)
+            names[input_index] = display.name or f"Volume {input_index + 1}"
+            windows[input_index] = _validate_window(display.window)
+            colormaps[input_index] = display.cmap
+        limits = _validate_window(window)
         super().__init__()
-        # Closing this window must not implicitly stop a host application's loop.
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setWindowTitle("vol5dkit")
-        self.resize(1200, 940)
+        self.resize(1200, 840)
         self.sources = sources
-        self.active = "A"
+        self.names = names
+        self.windows = windows
+        self.colormaps = colormaps
+        self.active = 0
         self.positions = (0.0, 0.5, 0.5, 0.5)
         self.channels = {name: 0 for name in sources}
-        self.clim = limits
+        self.shared_window = limits
+        self.share_window = limits is not None
+        self._shared_range_source = None
         self.interpolation = interpolation
         self.frame = None
         self.last_error = None
         self._revision = 0
-        self._range_after = 0
+        self._range_generation = 0
+        self._inflight = None
+        self._inflight_generation = 0
+        self._pending_generation = 0
+        self._colormaps_loaded = False
         self._busy = False
         self._pending = None
         self._closed = False
@@ -102,80 +119,131 @@ class Viewer(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
-        toolbar = QtWidgets.QHBoxLayout()
-        layout.addLayout(toolbar)
-        self.slot_box = QtWidgets.QComboBox()
-        self.slot_box.addItems(["A", "B"])
+        layout.setContentsMargins(0, 0, 0, 0)
+        toolbar = self.addToolBar("Viewer")
+        toolbar.setMovable(False)
+        self.input_box = QtWidgets.QComboBox()
+        for input_index, name in self.names.items():
+            self.input_box.addItem(name, input_index)
+        self.input_box.setMinimumContentsLength(14)
+        self.input_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         toolbar.addWidget(QtWidgets.QLabel("Input"))
-        toolbar.addWidget(self.slot_box)
+        toolbar.addWidget(self.input_box)
         self.mode_box = QtWidgets.QComboBox()
         self.mode_box.addItems(["Scalar", "RGB"])
         toolbar.addWidget(self.mode_box)
         self.channel_box = QtWidgets.QSpinBox()
         self.channel_box.setPrefix("C ")
         toolbar.addWidget(self.channel_box)
-        self.interpolation_box = QtWidgets.QComboBox()
-        self.interpolation_box.addItems(["nearest", "linear"])
-        self.interpolation_box.setCurrentText(interpolation)
-        toolbar.addWidget(self.interpolation_box)
-        self.colormap_box = QtWidgets.QComboBox()
-        self.colormap_box.addItems(["grays", "viridis", "hot", "coolwarm", "fire"])
-        toolbar.addWidget(self.colormap_box)
-        self.view3d_box = QtWidgets.QComboBox()
-        self.view3d_box.addItems(["slices", "volume", "hidden"])
-        toolbar.addWidget(QtWidgets.QLabel("3D"))
-        toolbar.addWidget(self.view3d_box)
-        self.stride_box = QtWidgets.QSpinBox()
-        self.stride_box.setRange(1, 4096)
-        self.stride_box.setPrefix("Preview stride ")
-        self.stride_box.setToolTip("Explicit 3D volume preview stride; native planes stay unchanged")
-        toolbar.addWidget(self.stride_box)
-        self.opacity_box = QtWidgets.QDoubleSpinBox()
-        self.opacity_box.setRange(0.0, 1.0)
-        self.opacity_box.setSingleStep(0.05)
-        self.opacity_box.setValue(0.15)
-        self.opacity_box.setPrefix("Opacity ")
-        toolbar.addWidget(self.opacity_box)
         fit = QtWidgets.QPushButton("Fit")
         toolbar.addWidget(fit)
-        toolbar.addStretch()
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
 
-        limits_row = QtWidgets.QHBoxLayout()
-        layout.addLayout(limits_row)
-        limits_row.addWidget(QtWidgets.QLabel("Shared scalar range"))
-        self.low_edit = QtWidgets.QLineEdit()
-        self.high_edit = QtWidgets.QLineEdit()
-        self.low_edit.setPlaceholderText("low")
-        self.high_edit.setPlaceholderText("high")
-        limits_row.addWidget(self.low_edit)
-        limits_row.addWidget(self.high_edit)
-        apply_range = QtWidgets.QPushButton("Apply")
-        reset_range = QtWidgets.QPushButton("Range from current input")
-        limits_row.addWidget(apply_range)
-        limits_row.addWidget(reset_range)
-        self.crosshair_box = QtWidgets.QCheckBox("Crosshair")
-        self.crosshair_box.setChecked(True)
-        self.crosshair_box.setToolTip("Show the shared SHW point in all three native planes")
-        limits_row.addWidget(self.crosshair_box)
-        limits_row.addStretch()
+        self.controls_dock = QtWidgets.QDockWidget("Controls", self)
+        self.controls_dock.setAllowedAreas(QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
+        self.controls_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.controls_scroll = QtWidgets.QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        panel = QtWidgets.QWidget()
+        settings = QtWidgets.QVBoxLayout(panel)
+        settings.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinAndMaxSize)
+        settings.setContentsMargins(8, 8, 8, 8)
+        self.controls_scroll.setWidget(panel)
+        self.controls_dock.setWidget(self.controls_scroll)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.controls_dock)
+        toolbar.addAction(self.controls_dock.toggleViewAction())
 
-        axes = QtWidgets.QGridLayout()
-        layout.addLayout(axes)
+        navigation = QtWidgets.QGroupBox("Navigation")
+        settings.addWidget(navigation)
+        axes = QtWidgets.QGridLayout(navigation)
         self.axis_sliders = {}
         self.axis_boxes = {}
         self.axis_labels = {}
-        for row, name in enumerate(("T", "S", "H", "W")):
+        for axis, name in enumerate(("T", "S", "H", "W")):
+            row = axis * 2
             axes.addWidget(QtWidgets.QLabel(name), row, 0)
             slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             box = QtWidgets.QSpinBox()
             label = QtWidgets.QLabel()
-            axes.addWidget(slider, row, 1)
+            label.setWordWrap(True)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+            axes.addWidget(label, row, 1)
             axes.addWidget(box, row, 2)
-            axes.addWidget(label, row, 3)
+            axes.addWidget(slider, row + 1, 0, 1, 3)
             self.axis_sliders[name], self.axis_boxes[name], self.axis_labels[name] = slider, box, label
             slider.valueChanged.connect(lambda index, n=name: self._move_axis(n, index))
             box.valueChanged.connect(lambda index, n=name: self._move_axis(n, index))
         axes.setColumnStretch(1, 1)
+
+        display = QtWidgets.QGroupBox("Display")
+        settings.addWidget(display)
+        display_layout = QtWidgets.QFormLayout(display)
+        self.interpolation_box = QtWidgets.QComboBox()
+        self.interpolation_box.addItems(["nearest", "linear"])
+        self.interpolation_box.setCurrentText(interpolation)
+        display_layout.addRow("Interpolation", self.interpolation_box)
+        self.colormap_box = _ColormapBox()
+        self.colormap_box.setEditable(True)
+        self.colormap_box.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.colormap_box.completer().setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        self.colormap_box.completer().setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        self.colormap_box.completer().setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+        for value, label in available_colormaps():
+            self.colormap_box.addItem(label, value)
+        display_layout.addRow("Colormap", self.colormap_box)
+        self.scalar_range = QtWidgets.QWidget()
+        range_layout = QtWidgets.QGridLayout(self.scalar_range)
+        range_layout.setContentsMargins(0, 0, 0, 0)
+        self.share_box = QtWidgets.QCheckBox("Share window")
+        self.share_box.setToolTip("Share the current input's window; uncheck to restore each input's own window.")
+        range_layout.addWidget(self.share_box, 0, 0, 1, 2)
+        self.low_edit = QtWidgets.QLineEdit()
+        self.high_edit = QtWidgets.QLineEdit()
+        self.low_edit.setPlaceholderText("low")
+        self.high_edit.setPlaceholderText("high")
+        range_layout.addWidget(self.low_edit, 1, 0)
+        range_layout.addWidget(self.high_edit, 1, 1)
+        apply_range = QtWidgets.QPushButton("Apply")
+        reset_range = QtWidgets.QPushButton("Auto")
+        reset_range.setToolTip("Use finite min/max over this input's complete TCSHW tensor.")
+        self.auto_range_button = reset_range
+        range_layout.addWidget(apply_range, 2, 0)
+        range_layout.addWidget(reset_range, 2, 1)
+        display_layout.addRow(self.scalar_range)
+        self.crosshair_box = QtWidgets.QCheckBox("Crosshair")
+        self.crosshair_box.setChecked(True)
+        self.crosshair_box.setToolTip("Show the shared SHW point in all three native planes")
+        display_layout.addRow(self.crosshair_box)
+
+        view3d = QtWidgets.QGroupBox("3D")
+        settings.addWidget(view3d)
+        view3d_layout = QtWidgets.QFormLayout(view3d)
+        self.view3d_box = QtWidgets.QComboBox()
+        for label, mode in (("Planes", "slices"), ("Volume", "volume"), ("Off", "hidden")):
+            self.view3d_box.addItem(label, mode)
+        view3d_layout.addRow("Mode", self.view3d_box)
+        self.volume_controls = QtWidgets.QWidget()
+        volume_layout = QtWidgets.QFormLayout(self.volume_controls)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        self.volume_shape_label = QtWidgets.QLabel()
+        self.volume_shape_label.setWordWrap(True)
+        volume_layout.addRow(self.volume_shape_label)
+        self.opacity_box = QtWidgets.QDoubleSpinBox()
+        self.opacity_box.setRange(0.0, 1.0)
+        self.opacity_box.setSingleStep(0.05)
+        self.opacity_box.setValue(0.15)
+        self.opacity_box.setToolTip(
+            "Per-sample alpha = normalized scalar value × this setting.\n"
+            "Samples accumulate along the viewing ray; this is not the final\n"
+            "image's transparency percentage. The scalar window also affects\n"
+            "the result. Every voxel is used."
+        )
+        volume_layout.addRow("3D opacity", self.opacity_box)
+        view3d_layout.addRow(self.volume_controls)
+        settings.addStretch()
 
         self.canvas = VolumeCanvas(on_hover=self._hover, on_pick=self._pick, on_scroll=self._scroll)
         self.canvas.widget.setToolTip(
@@ -184,17 +252,24 @@ class Viewer(QtWidgets.QMainWindow):
             "Shift+left drag: pan; right drag: zoom"
         )
         layout.addWidget(self.canvas.widget, 1)
+        self.canvas.widget.setMinimumSize(1, 1)
         self.status = QtWidgets.QLabel("Preparing native slices…")
         self.status.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.status)
+        self.status.setWordWrap(True)
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self.status.setFixedHeight(2 * self.status.fontMetrics().lineSpacing() + 4)
+        self.statusBar().addWidget(self.status, 1)
+        self.resizeDocks([self.controls_dock], [300], QtCore.Qt.Orientation.Horizontal)
 
-        self.slot_box.currentTextChanged.connect(self._select_slot)
+        self.input_box.currentIndexChanged.connect(self._select_input)
         self.mode_box.currentTextChanged.connect(self._change_mode)
         self.channel_box.valueChanged.connect(self._change_channel)
         self.interpolation_box.currentTextChanged.connect(self._change_interpolation)
-        self.colormap_box.currentTextChanged.connect(self.canvas.set_colormap)
+        self.colormap_box.activated.connect(self._choose_colormap)
+        self.colormap_box.lineEdit().returnPressed.connect(self._choose_colormap)
+        self.colormap_box.opening.connect(self._load_colormaps)
         self.view3d_box.currentTextChanged.connect(self._change_3d)
-        self.stride_box.valueChanged.connect(lambda _: self._request())
+        self.share_box.toggled.connect(self._change_share)
         self.opacity_box.valueChanged.connect(self.canvas.set_opacity)
         self.crosshair_box.toggled.connect(self.canvas.set_crosshair_visible)
         fit.clicked.connect(self.canvas.reset_view)
@@ -204,11 +279,21 @@ class Viewer(QtWidgets.QMainWindow):
         self.high_edit.returnPressed.connect(self._apply_range)
 
         from PySide6.QtGui import QShortcut, QKeySequence
-        for key, name in (("A", "A"), ("B", "B")):
+        for key, name in (("A", 0), ("B", 1)):
             shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.activated.connect(lambda n=name: self._select_slot(n))
+            shortcut.activated.connect(lambda n=name: self._select_input(n))
         toggle = QShortcut(QKeySequence("Tab"), self)
-        toggle.activated.connect(lambda: self._select_slot("B" if self.active == "A" else "A"))
+        toggle.activated.connect(self._next_input)
+
+        # Invalid startup palettes fail before the worker is started.
+        try:
+            name = self.colormaps[self.active]
+            self._prepared_palette = (self.canvas.palette if name == self.canvas.colormap
+                                      else self.canvas.prepare_colormap(name))
+            self.canvas.set_colormap(self._prepared_palette)
+        except Exception:
+            self.canvas.close()
+            raise
 
         self._thread = QtCore.QThread(self)
         self._worker = _Worker()
@@ -217,17 +302,40 @@ class Viewer(QtWidgets.QMainWindow):
         self._worker.finished.connect(self._received)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.start()
-        _viewers.add(self)
         self._sync_controls()
         self._request()
+
+    @property
+    def current_window(self):
+        return self.shared_window if self.share_window else self.windows[self.active]
+
+    def _window_for(self, input_index):
+        return self.shared_window if self.share_window else self.windows[input_index]
+
+    def _set_window(self, value):
+        if self.share_window:
+            self.shared_window = value
+        else:
+            self.windows[self.active] = value
+
+    def _sync_colormap(self):
+        value = self.colormaps[self.active]
+        # Preserve the familiar unprefixed VisPy API while displaying its source.
+        index = self.colormap_box.findData(value)
+        if index < 0 and ":" not in value:
+            index = self.colormap_box.findData("vispy:" + value)
+        if index < 0:
+            self.colormap_box.addItem(value, value)
+            index = self.colormap_box.count() - 1
+        with QtCore.QSignalBlocker(self.colormap_box):
+            self.colormap_box.setCurrentIndex(index)
 
     def _sync_controls(self):
         self._syncing = True
         try:
             source = self.sources[self.active]
             shape = source.volume.shape
-            self.slot_box.model().item(1).setEnabled("B" in self.sources)
-            self.slot_box.setCurrentText(self.active)
+            self.input_box.setCurrentIndex(self.active)
             self.mode_box.setCurrentText("RGB" if source.rgb else "Scalar")
             self.mode_box.model().item(1).setEnabled(shape[1] == 3)
             self.channel_box.setRange(0, shape[1] - 1)
@@ -235,11 +343,15 @@ class Viewer(QtWidgets.QMainWindow):
             self.channel_box.setValue(self.channels[self.active])
             self.channel_box.setEnabled(not source.rgb and shape[1] > 1)
             self.colormap_box.setEnabled(not source.rgb)
+            self.scalar_range.setEnabled(not source.rgb)
+            self.share_box.setChecked(self.share_window)
+            self._sync_colormap()
             self.view3d_box.model().item(1).setEnabled(not source.rgb)
-            if source.rgb and self.view3d_box.currentText() == "volume":
-                self.view3d_box.setCurrentText("slices")
-            self.stride_box.setEnabled(self.view3d_box.currentText() == "volume")
-            self.opacity_box.setEnabled(self.view3d_box.currentText() == "volume")
+            if source.rgb and self.view3d_box.currentData() == "volume":
+                self.view3d_box.setCurrentIndex(0)
+            volume_mode = self.view3d_box.currentData() == "volume"
+            self.volume_controls.setVisible(volume_mode)
+            self.opacity_box.setEnabled(volume_mode)
             for n, length, position in zip(("T", "S", "H", "W"), (shape[0], *shape[2:]), self.positions):
                 index = relative_index(position, length)
                 for control in (self.axis_sliders[n], self.axis_boxes[n]):
@@ -250,9 +362,12 @@ class Viewer(QtWidgets.QMainWindow):
                 if n == "T":
                     text += f"   coordinate {source.volume.times[index]:g}"
                 self.axis_labels[n].setText(text)
-            if self.clim is not None:
-                self.low_edit.setText(str(self.clim[0]))
-                self.high_edit.setText(str(self.clim[1]))
+            if self.current_window is not None:
+                self.low_edit.setText(str(self.current_window[0]))
+                self.high_edit.setText(str(self.current_window[1]))
+            else:
+                self.low_edit.clear()
+                self.high_edit.clear()
         finally:
             self._syncing = False
 
@@ -263,59 +378,102 @@ class Viewer(QtWidgets.QMainWindow):
         self.last_error = None
         request = Request(
             self._revision, self.active, self.sources[self.active], self.positions,
-            channel=self.channels[self.active], clim=self.clim,
-            volume_3d=self.view3d_box.currentText() == "volume",
-            preview_stride=self.stride_box.value(),
+            channel=self.channels[self.active], window=self.current_window,
+            volume_3d=self.view3d_box.currentData() == "volume",
+            range_source=self._shared_range_source if self.share_window and self.current_window is None else None,
         )
-        self.status.setText(f"Preparing {self.active}…")
+        self.status.setText(f"Preparing {self.names[self.active]}…")
+        if request.volume_3d:
+            self.volume_shape_label.setText("Preparing volume…")
         if self._busy:
             self._pending = request
+            self._pending_generation = self._range_generation
         else:
             self._busy = True
+            self._inflight = request
+            self._inflight_generation = self._range_generation
             self._prepare.emit(request)
 
     @QtCore.Slot(int, object, str)
     def _received(self, revision, frame, error):
         self._busy = False
+        request, self._inflight = self._inflight, None
         if self._closed:
             return
-        # Establish the first scalar range even if that initial frame was
-        # superseded by a slice/A-B request. Explicit range resets invalidate it.
-        if frame is not None and not frame.source.rgb and self.clim is None and revision >= self._range_after:
-            self.clim = frame.clim
+        # A superseded navigation request may still fill its own immutable
+        # snapshot's range cache. Manual edits/Auto/share changes invalidate it.
+        if (frame is not None and request is not None and request.window is None
+                and not frame.source.rgb
+                and self._inflight_generation == self._range_generation
+                and self.sources.get(frame.input_index) is frame.source):
+            if self.share_window:
+                if (self.shared_window is None
+                        and request.range_source is self._shared_range_source):
+                    self.shared_window = frame.window
+            elif self.windows[frame.input_index] is None:
+                self.windows[frame.input_index] = frame.window
             self._sync_controls()
         if revision == self._revision:
             if error:
                 self.last_error = error
                 self.status.setText(error)
             else:
+                previous_palette = self.canvas.palette
                 try:
+                    # Commit input palette and pixels in the same GUI callback.
+                    # Until then the last complete frame keeps its own palette.
                     self.canvas.set_frame(
                         frame, interpolation=self.interpolation,
-                        mode_3d=self.view3d_box.currentText(), opacity=self.opacity_box.value(),
+                        mode_3d=self.view3d_box.currentData(), opacity=self.opacity_box.value(),
+                        palette=self._prepared_palette,
                     )
                 except Exception as exc:
+                    if self.canvas.palette is not previous_palette:
+                        try:
+                            self.canvas.set_colormap(previous_palette)
+                        except Exception:
+                            # A renderer/provider failure may also prevent
+                            # rollback. Keep the original display error visible.
+                            pass
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self.status.setText(self.last_error)
                 else:
                     self.frame = frame
-                    self.setWindowTitle(f"vol5dkit · {frame.slot} · {tuple(frame.source.volume.shape)}")
+                    if frame.volume_buffer is not None:
+                        shape = " × ".join(str(n) for n in frame.volume_buffer.shape)
+                        self.volume_shape_label.setText(f"Volume SHW: {shape}")
+                    self.setWindowTitle(f"vol5dkit · {self.names[frame.input_index]} · {tuple(frame.source.volume.shape)}")
                     self.status.setText(
-                        f"{frame.slot}  T,C,S,H,W = {frame.indices}  |  "
+                        f"{self.names[frame.input_index]}  T,C,S,H,W = {frame.indices}  |  "
                         f"{frame.source.volume.dtype} on {frame.source.volume.device}  |  "
                         "Click/drag: crosshair · Wheel: slice · Ctrl+wheel: zoom"
                     )
         if self._pending is not None:
             request, self._pending = self._pending, None
             self._busy = True
-            self._prepare.emit(replace(request, clim=self.clim))
+            # Reuse a range just computed for this input instead of scanning it
+            # again for the pending slice. The queue still contains one request.
+            self._inflight = replace(request, window=self._window_for(request.input_index))
+            self._inflight_generation = self._pending_generation
+            self._prepare.emit(self._inflight)
 
-    def _select_slot(self, name):
-        if self._syncing or name not in self.sources or name == self.active:
+    def _select_input(self, input_index):
+        if self._syncing or input_index not in self.sources or input_index == self.active:
             return
-        self.active = name
+        try:
+            palette = self.canvas.prepare_colormap(self.colormaps[input_index])
+        except Exception as exc:
+            self.last_error = f"Colormap: {type(exc).__name__}: {exc}"
+            self.status.setText(self.last_error)
+            self._sync_controls()
+            return
+        self.active = input_index
+        self._prepared_palette = palette
         self._sync_controls()
         self._request()
+
+    def _next_input(self):
+        self._select_input((self.active + 1) % len(self.sources))
 
     def _move_axis(self, name, index):
         if self._syncing:
@@ -344,8 +502,6 @@ class Viewer(QtWidgets.QMainWindow):
             self.status.setText(self.last_error)
             self._sync_controls()
             return
-        # Changing display mode must retain the original producer dependency.
-        source = replace(source, ready=self.sources[self.active].ready)
         self.sources[self.active] = source
         self._sync_controls()
         self._request()
@@ -353,6 +509,46 @@ class Viewer(QtWidgets.QMainWindow):
     def _change_interpolation(self, value):
         self.interpolation = value
         self.canvas.set_interpolation(value)
+
+    def _load_colormaps(self):
+        if self._colormaps_loaded:
+            return
+        try:
+            choices = available_colormaps(extended=True)
+        except Exception as exc:
+            self.last_error = f"Colormaps: {type(exc).__name__}: {exc}"
+            self.status.setText(self.last_error)
+            return
+        with QtCore.QSignalBlocker(self.colormap_box):
+            self.colormap_box.clear()
+            for value, label in choices:
+                self.colormap_box.addItem(label, value)
+        self._colormaps_loaded = True
+        self._sync_colormap()
+        self.last_error = None
+        self.status.setText("Colormaps loaded")
+
+    def _choose_colormap(self, *_):
+        text = self.colormap_box.currentText()
+        index = self.colormap_box.findText(text)
+        value = self.colormap_box.itemData(index) if index >= 0 else text.strip()
+        self._change_colormap(value)
+
+    def _change_colormap(self, value):
+        try:
+            palette = self.canvas.prepare_colormap(value)
+            if self.frame is not None and self.frame.source is self.sources[self.active]:
+                self.canvas.set_colormap(palette)
+        except Exception as exc:
+            self.last_error = f"Colormap: {type(exc).__name__}: {exc}"
+            self.status.setText(self.last_error)
+            self._sync_colormap()
+        else:
+            self.colormaps[self.active] = value
+            self._prepared_palette = palette
+            self._sync_colormap()
+            self.last_error = None
+            self.status.setText(f"Colormap: {value}")
 
     def _change_3d(self, value):
         if not self._syncing:
@@ -369,16 +565,34 @@ class Viewer(QtWidgets.QMainWindow):
                     values.append(int(value))
                 except ValueError:
                     values.append(float(value))
-            self.clim = _limits(values)
+            limits = _validate_window(values)
         except (TypeError, ValueError, OverflowError) as exc:
             self.last_error = f"Invalid range: {exc}"
             self.status.setText(self.last_error)
             return
+        self._range_generation += 1
+        self._set_window(limits)
         self._request()
 
     def _reset_range(self):
-        self.clim = None
-        self._range_after = self._revision + 1
+        self._range_generation += 1
+        self._set_window(None)
+        if self.share_window:
+            self._shared_range_source = self.sources[self.active]
+        self._sync_controls()
+        self._request()
+
+    def _change_share(self, checked):
+        if self._syncing:
+            return
+        self._range_generation += 1
+        if checked:
+            self.shared_window = self.windows[self.active]
+            self._shared_range_source = self.sources[self.active] if self.shared_window is None else None
+        else:
+            self._shared_range_source = None
+        self.share_window = checked
+        self._sync_controls()
         self._request()
 
     def _hover(self, name, row, col):
@@ -395,7 +609,7 @@ class Viewer(QtWidgets.QMainWindow):
         world = frame.source.volume.index_to_world(shw)
         value = plane.raw[row, col].tolist()
         self.status.setText(
-            f"{frame.slot} · {name} · SHW {tuple(shw)} · value {value} · "
+            f"{self.names[frame.input_index]} · {name} · SHW {tuple(shw)} · value {value} · "
             f"XYZ ({world[0]:g}, {world[1]:g}, {world[2]:g})"
         )
 
@@ -426,64 +640,16 @@ class Viewer(QtWidgets.QMainWindow):
         if index != current:
             self._move_axis("SHW"[axis], index)
 
-    def update(self, slot=None, volume=None, *, rgb=None):
-        """Replace A/B with a detached alias, preserving navigation and range.
-
-        Call within the producing CUDA stream or establish the calling stream's
-        dependency first. With no arguments this retains QWidget.update().
-        """
-        if slot is None and volume is None:
-            return super().update()
-        _main_thread()
-        if self._closed:
-            raise RuntimeError("Cannot update a closed viewer")
-        if slot not in ("A", "B"):
-            raise ValueError("slot must be 'A' or 'B'")
-        previous = self.sources.get(slot)
-        if rgb is None:
-            rgb = previous.rgb if previous is not None else False
-        source = make_source(volume, rgb)
-        self.sources[slot] = source
-        self.channels.setdefault(slot, 0)
-        self._sync_controls()
-        if slot == self.active:
-            self._request()
-
     def closeEvent(self, event):
         if not self._closed:
             self._closed = True
             self._pending = None
             self._thread.quit()
             self._thread.wait()
+            self._inflight = None
+            self._worker.clear_volume()
+            self._shared_range_source = None
             self.canvas.close()
             self.frame = None
             self.sources.clear()
-            _viewers.discard(self)
-            if _loop_running and not _viewers:
-                _app().quit()
         event.accept()
-
-
-def view(a, b=None, *, rgb=False, interpolation="nearest", clim=None, block=True):
-    """Open a viewer and optionally run the desktop event loop."""
-    viewer = Viewer(a, b, rgb=rgb, interpolation=interpolation, clim=clim)
-    del a, b
-    viewer.show()
-    if block:
-        run()
-    return viewer
-
-
-def run():
-    """Run this library's event loop until its last viewer closes."""
-    global _loop_running
-    application = _app()
-    if _loop_running or QtCore.QThread.currentThread().loopLevel() > 0:
-        raise RuntimeError("A Qt event loop is already running; use view(..., block=False)")
-    if not _viewers:
-        return 0
-    _loop_running = True
-    try:
-        return application.exec()
-    finally:
-        _loop_running = False
