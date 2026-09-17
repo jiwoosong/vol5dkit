@@ -5,12 +5,14 @@ import gc
 import json
 from pathlib import Path
 import platform
+import tempfile
 import time
 
 import numpy as np
 import torch
 
 import vol5dkit as v5
+from vol5dkit._view import _load_snapshot, _normalize_inputs, _write_snapshot
 from vol5dkit.viewer._data import Request, make_source, prepare_frame
 
 
@@ -35,125 +37,174 @@ def synchronize(device):
         torch.cuda.synchronize()
 
 
-def wrapper_benchmark(device, iterations):
-    small = v5.Volume(torch.rand((1, 1, 16, 32, 32), device=device))
-    repetitions = 200
-    wrapped, native, endpoint = [], [], []
-    for _ in range(20):
-        small.with_data((small.tensor * 1.01 + 0.01).clamp(0, 1))
-    synchronize(device)
-    for _ in range(iterations):
-        start = time.perf_counter()
-        for _ in range(repetitions):
-            result = small.with_data(small.tensor)
-        wrapped.append((time.perf_counter() - start) * 1000 / repetitions)
-        for samples, attach in ((native, False), (endpoint, True)):
+def core_benchmark(device, iterations):
+    """Separate coordinate validation, result attachment, reindexing and kernels."""
+    torch.manual_seed(0)
+
+    def measure(operation, repetitions):
+        for _ in range(10):
+            operation()
+        samples = []
+        for _ in range(iterations):
             synchronize(device)
-            start = time.perf_counter()
+            started = time.perf_counter()
             for _ in range(repetitions):
-                processed = (small.tensor * 1.01 + 0.01).clamp(0, 1)
-                if attach:
-                    result = small.with_data(processed)
+                operation()
             synchronize(device)
-            samples.append((time.perf_counter() - start) * 1000 / repetitions)
+            samples.append((time.perf_counter() - started) * 1000 / repetitions)
+        return summary(samples)
+
+    coordinates = []
+    for frames in (1, 1000, 100000):
+        tensor = torch.empty((frames, 1, 1, 1, 1), device=device)
+        ref = v5.Volume(tensor)
+        coordinates.append({
+            "T": frames,
+            "construct_default_times": measure(lambda: v5.Volume(tensor), 10),
+            "construct_existing_coordinates": measure(
+                lambda: v5.Volume(tensor, spacing=ref.spacing, origin=ref.origin,
+                                  direction=ref.direction, times=ref.times), 10
+            ),
+            "reference_same_grid": measure(lambda: v5.Volume(tensor, ref=ref), 200),
+        })
+
+    ref = v5.Volume(torch.rand((1, 1, 16, 32, 32), device=device), spacing=(2, 1, 0.5))
+    resized = torch.empty((1, 1, 32, 64, 64), device=device)
+    spatial = {
+        "shape_tcshw": list(ref.shape),
+        "attach_changed_grid": measure(lambda: v5.Volume(resized, ref=ref), 200),
+        "crop_view": measure(lambda: ref.crop(s=slice(1, None, 2)), 200),
+        "permute_view": measure(lambda: ref.permute_spatial("w", "s", "h"), 200),
+        "flip_copy": measure(lambda: ref.flip_spatial("s", "w"), 200),
+    }
+
+    # Both paths pass the very same native Tensor to this ordinary torch model.
+    model = torch.nn.Sequential(
+        torch.nn.Conv3d(1, 4, 3, padding=1), torch.nn.ReLU(),
+        torch.nn.Conv3d(4, 1, 3, padding=1),
+    ).to(device).eval()
+    tensor = ref.tensor.detach().requires_grad_()
+    volume = v5.Volume(tensor, ref=ref)
+    direct = model(tensor)
+    via_volume = model(volume.tensor)
+    torch.testing.assert_close(direct, via_volume)
+    direct_grad = torch.autograd.grad(direct.sum(), tensor)[0]
+    volume_grad = torch.autograd.grad(via_volume.sum(), tensor)[0]
+    torch.testing.assert_close(direct_grad, volume_grad)
+    direct_samples, volume_samples = [], []
+    with torch.inference_mode():
+        for _ in range(10):
+            model(tensor)
+            model(volume.tensor)
+        for index in range(iterations):
+            # Alternate order to reduce systematic warm-up / clock bias.
+            paths = [(direct_samples, lambda: model(tensor)),
+                     (volume_samples, lambda: model(volume.tensor))]
+            for samples, forward in paths[::1 if index % 2 == 0 else -1]:
+                synchronize(device)
+                started = time.perf_counter()
+                for _ in range(20):
+                    forward()
+                synchronize(device)
+                samples.append((time.perf_counter() - started) * 1000 / 20)
     return {
-        "shape": list(small.shape),
-        "repetitions_per_sample": repetitions,
-        "with_data_only": summary(wrapped),
-        "native_processing": summary(native),
-        "processing_with_one_result_wrapper": summary(endpoint),
-        "note": "CPU wall time per call; processing samples include device completion. No wrapper is inserted inside torch operations.",
+        "coordinates": coordinates,
+        "spatial": spatial,
+        "forward": {
+            "model": "Conv3d(1,4,3)-ReLU-Conv3d(4,1,3), padding=1, eval",
+            "same_tensor_object": volume.tensor is tensor,
+            "outputs_and_input_gradients_match": True,
+            "native_tensor": summary(direct_samples),
+            "volume_tensor": summary(volume_samples),
+        },
+        "note": "Per-call wall time in milliseconds, with warm-up and CUDA synchronization. Model timings use inference_mode; output/gradient correctness is checked separately. No timing ratio is a pass/fail threshold.",
     }
 
 
-def gui_benchmark(volume, rgb, iterations):
-    from PySide6.QtWidgets import QApplication
+def gui_benchmark(volume, rgb, iterations, volume_3d=False):
+    from vol5dkit._view import _launch
 
-    started = time.perf_counter()
-    viewer = v5.view(volume, rgb=rgb, block=False)
-    app = QApplication.instance()
-    try:
-        deadline = time.monotonic() + 60
-        while viewer.frame is None and viewer.last_error is None:
-            if time.monotonic() > deadline:
-                raise TimeoutError("GUI initial preparation timed out")
-            app.processEvents()
-            time.sleep(0.001)
-        if viewer.last_error is not None:
-            raise RuntimeError(viewer.last_error)
-        app.processEvents()
-        first_start = time.perf_counter()
-        image = viewer.canvas.render()
-        first_render_ms = (time.perf_counter() - first_start) * 1000
-        initial_ms = (time.perf_counter() - started) * 1000
-        samples = []
-        for _ in range(iterations):
-            app.processEvents()
-            before = time.perf_counter()
-            image = viewer.canvas.render()
-            samples.append((time.perf_counter() - before) * 1000)
-        return {
-            "initial_window_prepare_and_render_ms": initial_ms,
-            "first_explicit_render_readback_ms": first_render_ms,
-            "warm_render_readback": summary(samples),
-            "framebuffer_shape": list(image.shape),
-            "note": "Real OpenGL drawing and framebuffer readback for a retained frame; not interactive FPS or GPU-only draw time.",
-        }
-    finally:
-        viewer.close()
-        app.processEvents()
+    with tempfile.TemporaryDirectory(prefix="vol5dkit-benchmark-") as directory:
+        report_path = Path(directory) / "timings.json"
+        started = time.perf_counter()
+        viewer = _launch(
+            [v5.Display(volume, rgb=rgb)],
+            smoke=True, report=report_path, iterations=iterations, volume_3d=volume_3d,
+        )
+        returned_ms = (time.perf_counter() - started) * 1000
+        try:
+            code = viewer.wait(timeout=120)
+            if code:
+                raise RuntimeError(f"Snapshot viewer exited with code {code}; see {viewer.log_path}")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        finally:
+            viewer.close()
+    report["view_return_ms"] = returned_ms
+    for key in ("navigation_prepare", "navigation_render"):
+        samples = report.get(f"{key}_samples_ms", [])
+        if samples:
+            report[key] = summary(samples)
+    report["snapshot_bytes"] = volume.tensor.numel() * volume.tensor.element_size()
+    report["note"] = (
+        "Independent child with a full CPU snapshot; initial copy and file write are separate. "
+        "Navigation timings include the child's Qt event loop and diagnostic timer polling. "
+        "Rendering includes framebuffer readback, not GPU-only drawing."
+    )
+    return report
 
 
 def benchmark_case(name, device, iterations, gui=False, volume_3d=False):
     shape, rgb = CASES[name]
     torch.manual_seed(0)
-    tensor = torch.rand(shape, device=device, dtype=torch.float32)
-    volume = v5.Volume(tensor)
+    volume = v5.Volume(torch.rand(shape, device=device, dtype=torch.float32))
     synchronize(device)
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        baseline_gpu = torch.cuda.memory_allocated()
-    else:
-        baseline_gpu = None
-    started = time.perf_counter()
-    source = make_source(volume, rgb=rgb)
-    registration_ms = (time.perf_counter() - started) * 1000
-    request = Request(0, "A", source, (0, 0.5, 0.5, 0.5), volume_3d=volume_3d and not rgb)
-    started = time.perf_counter()
-    frame = prepare_frame(request)
-    initial_ms = (time.perf_counter() - started) * 1000
-    clim = frame.clim
-    samples = []
-    for index in range(iterations):
-        fraction = (index + 1) / (iterations + 1)
-        request = Request(
-            index + 1, "A", source, (fraction, fraction, 1 - fraction, 0.5),
-            clim=clim, volume_3d=volume_3d and not rgb,
-        )
+    volume_3d = volume_3d and not rgb
+    with tempfile.TemporaryDirectory(prefix="vol5dkit-benchmark-") as directory:
+        # Exercise the public transport: complete CPU snapshot, file write, mmap.
+        manifest = _write_snapshot(_normalize_inputs([v5.Display(volume, rgb=rgb)]), directory)
+        started = time.perf_counter()
+        inputs, transport = _load_snapshot(manifest)
+        load_ms = (time.perf_counter() - started) * 1000
+        source = make_source(inputs[0].data, rgb)
+        request = Request(0, 0, source, (0, 0.5, 0.5, 0.5), volume_3d=volume_3d)
         started = time.perf_counter()
         frame = prepare_frame(request)
-        samples.append((time.perf_counter() - started) * 1000)
-    cpu_bytes = sum(plane.raw.numel() * plane.raw.element_size() + plane.image.nbytes for plane in frame.planes)
-    if frame.volume is not None:
-        cpu_bytes += frame.volume.nbytes
-    result = {
-        "case": name,
-        "shape_tcshw": list(shape),
-        "rgb": rgb,
-        "dtype": str(tensor.dtype),
-        "input_bytes": tensor.numel() * tensor.element_size(),
-        "registration_ms": registration_ms,
-        "initial_prepare_ms": initial_ms,
-        "warm_prepare": summary(samples),
-        "clim": clim,
-        "volume_3d": request.volume_3d,
-        "d2h_image_bytes_per_frame": frame.transfer_bytes,
-        "owned_cpu_frame_bytes": cpu_bytes,
-        "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated() if device == "cuda" else None,
-        "extra_gpu_peak_bytes": torch.cuda.max_memory_allocated() - baseline_gpu if device == "cuda" else None,
-    }
+        initial_ms = (time.perf_counter() - started) * 1000
+        window = frame.window
+        buffer = frame.volume_buffer
+        uncached, cached = [], []
+        for index in range(iterations):
+            fraction = (index + 1) / (iterations + 1)
+            request = Request(index + 1, 0, source, (0, fraction, 1 - fraction, 0.5),
+                              window=window, volume_3d=volume_3d)
+            if volume_3d:
+                started = time.perf_counter()
+                uncached_frame = prepare_frame(request)
+                uncached.append((time.perf_counter() - started) * 1000)
+                assert uncached_frame.volume_buffer is not buffer
+                del uncached_frame
+            started = time.perf_counter()
+            frame = prepare_frame(request, volume_buffer=buffer)
+            cached.append((time.perf_counter() - started) * 1000)
+            assert frame.volume_buffer is buffer
+        plane_bytes = sum(p.raw.numel() * p.raw.element_size() + p.image.nbytes for p in frame.planes)
+        result = {
+            "case": name, "shape_tcshw": list(shape), "rgb": rgb,
+            "dtype": str(volume.dtype), "input_bytes": volume.tensor.numel() * volume.tensor.element_size(),
+            "snapshot_copy_ms": transport["snapshot_copy_ms"],
+            "snapshot_write_ms": transport["snapshot_write_ms"], "mmap_load_ms": load_ms,
+            "initial_prepare_ms": initial_ms, "window": window, "volume_3d": volume_3d,
+            "spatial_prepare": summary(cached),
+            "spatial_prepare_without_buffer_reuse": summary(uncached) if uncached else None,
+            "owned_plane_bytes": plane_bytes,
+            "volume_buffer_bytes": buffer.nbytes if buffer is not None else 0,
+            "volume_buffer_reused": volume_3d,
+            "note": "Full snapshot from the selected device; frame preparation on CPU. Spatial navigation keeps T/C/window fixed. Owned buffer sizes exclude mapped input and bounded normalization workspace.",
+        }
+        del inputs, source, request, frame, buffer
+        gc.collect()
     if gui:
-        result["gui"] = gui_benchmark(volume, rgb, iterations)
+        result["gui"] = gui_benchmark(volume, rgb, iterations, volume_3d)
     return result
 
 
@@ -162,8 +213,9 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--cases", nargs="+", choices=tuple(CASES), default=list(CASES))
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--gui", action="store_true", help="also measure an actual local OpenGL render and readback")
-    parser.add_argument("--volume-3d", action="store_true", help="explicitly transfer scalar SHW previews")
+    parser.add_argument("--gui", action="store_true", help="also measure independent snapshot launch, preparation and real OpenGL rendering")
+    parser.add_argument("--volume-3d", action="store_true", help="measure full scalar 3D preparation and buffer reuse")
+    parser.add_argument("--core-only", action="store_true", help="measure coordinate and model paths without large display cases")
     parser.add_argument("--output", type=Path, help="write the same JSON report to this path")
     args = parser.parse_args()
     if args.iterations < 1:
@@ -181,10 +233,10 @@ def main():
             "gpu": torch.cuda.get_device_name() if args.device == "cuda" else None,
         },
         "iterations": args.iterations,
-        "wrapper": wrapper_benchmark(args.device, args.iterations),
+        "core": core_benchmark(args.device, args.iterations),
         "cases": [],
     }
-    for case in args.cases:
+    for case in (() if args.core_only else args.cases):
         report["cases"].append(benchmark_case(case, args.device, args.iterations, args.gui, args.volume_3d))
         gc.collect()
         if args.device == "cuda":

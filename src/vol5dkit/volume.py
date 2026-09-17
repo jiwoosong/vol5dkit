@@ -10,6 +10,12 @@ import numpy as np
 import torch
 
 
+_UNSET = object()
+_SPACING = (1.0, 1.0, 1.0)
+_ORIGIN = (0.0, 0.0, 0.0)
+_DIRECTION = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
 def _float_tuple(values: Any, length: int, name: str) -> tuple[float, ...]:
     """Canonicalize small CPU metadata, retaining already canonical tuples."""
     try:
@@ -40,13 +46,16 @@ def _as_tensor(data: torch.Tensor | np.ndarray) -> torch.Tensor:
     return data
 
 
-@dataclass(frozen=True, slots=True, eq=False, repr=False)
+@dataclass(frozen=True, slots=True, eq=False, repr=False, init=False)
 class Volume:
     """A native TCSHW tensor with immutable sampling metadata.
 
     Tensor inputs are retained exactly. Compatible writable NumPy inputs share
-    storage. No construction, processing, or conversion automatically infers a
-    changed sampling grid. Use ``tensor`` for ordinary PyTorch operations.
+    storage. Use ``tensor`` for ordinary PyTorch operations. ``Volume(y, ref=a)``
+    assigns a result the reference's outer voxel bounds and times. If SHW
+    changes, spacing and origin preserve those bounds and their center; values
+    are never resampled. T must match, while C may change. Cropped or warped
+    data should instead use the coordinates defined by that operation.
 
     ``spacing`` is SHW; ``origin`` is XYZ at voxel index (0, 0, 0).
     Columns of ``direction`` are the world directions of XYZ index axes.
@@ -57,13 +66,53 @@ class Volume:
     """
 
     tensor: torch.Tensor
-    spacing: tuple[float, float, float] = field(default=(1.0, 1.0, 1.0), kw_only=True)
-    origin: tuple[float, float, float] = field(default=(0.0, 0.0, 0.0), kw_only=True)
-    direction: tuple[tuple[float, float, float], ...] = field(
-        default=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
-        kw_only=True,
-    )
+    spacing: tuple[float, float, float] = field(default=_SPACING, kw_only=True)
+    origin: tuple[float, float, float] = field(default=_ORIGIN, kw_only=True)
+    direction: tuple[tuple[float, float, float], ...] = field(default=_DIRECTION, kw_only=True)
     times: tuple[float, ...] | None = field(default=None, kw_only=True)
+
+    def __init__(
+        self,
+        tensor: torch.Tensor | np.ndarray,
+        *,
+        ref: Volume | None = None,
+        spacing: Any = _UNSET,
+        origin: Any = _UNSET,
+        direction: Any = _UNSET,
+        times: Any = _UNSET,
+    ) -> None:
+        reuse = False
+        if ref is not None:
+            if not isinstance(ref, Volume):
+                raise TypeError("ref must be a Volume")
+            if any(value is not _UNSET for value in (spacing, origin, direction, times)):
+                raise ValueError("ref cannot be combined with explicit spacing, origin, direction, or times")
+            tensor = _as_tensor(tensor)
+            if tensor.shape[0] != ref.shape[0]:
+                raise ValueError("ref requires the same T; supply explicit times without ref")
+            if len(ref.times) != tensor.shape[0]:
+                raise ValueError("times must match T; structural in-place tensor mutations are unsupported")
+            spacing, origin, direction, times = ref.spacing, ref.origin, ref.direction, ref.times
+            if tensor.shape[2:] == ref.shape[2:]:
+                # Only exact base instances can reuse validation: a subclass
+                # may have extra fields or additional metadata constraints.
+                reuse = type(self) is Volume and type(ref) is Volume
+            else:
+                spacing = tuple(d * n / m for d, n, m in zip(ref.spacing, ref.shape[2:], tensor.shape[2:]))
+                offset_xyz = ((np.asarray(spacing) - np.asarray(ref.spacing)) / 2)[::-1]
+                origin = tuple(np.asarray(ref.origin) + np.asarray(direction) @ offset_xyz)
+        else:
+            spacing = _SPACING if spacing is _UNSET else spacing
+            origin = _ORIGIN if origin is _UNSET else origin
+            direction = _DIRECTION if direction is _UNSET else direction
+            times = None if times is _UNSET else times
+        object.__setattr__(self, "tensor", tensor)
+        object.__setattr__(self, "spacing", spacing)
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "direction", direction)
+        object.__setattr__(self, "times", times)
+        if not reuse:
+            self.__post_init__()
 
     def __post_init__(self) -> None:
         tensor = _as_tensor(self.tensor)
@@ -112,24 +161,15 @@ class Volume:
             f"device={self.device}, spacing={self.spacing}, time_count={len(self.times)})"
         )
 
-    def with_data(self, tensor: torch.Tensor | np.ndarray) -> Volume:
-        """Declare that a result uses this sampling grid; C may change.
-
-        Shape checks catch accidental T/SHW changes, but cannot prove that an
-        operation preserved coordinates. This declaration is the caller's.
-        """
-        tensor = _as_tensor(tensor)
-        if tensor.shape[0] != self.shape[0] or tensor.shape[2:] != self.shape[2:]:
-            raise ValueError("with_data requires the same T and SHW sampling grid")
-        return replace(self, tensor=tensor)
-
     def to(self, *args: Any, **kwargs: Any) -> Volume:
         """Apply Tensor.to(), retaining coordinates and its autograd semantics."""
-        return replace(self, tensor=self.tensor.to(*args, **kwargs))
+        tensor = self.tensor.to(*args, **kwargs)
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
 
     def clone(self, **kwargs: Any) -> Volume:
         """Clone tensor storage with Tensor.clone(), retaining coordinates."""
-        return replace(self, tensor=self.tensor.clone(**kwargs))
+        tensor = self.tensor.clone(**kwargs)
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
 
     def numpy(self, copy: bool = False) -> np.ndarray:
         """Detach and convert to NumPy without implicit dtype conversion.
@@ -173,6 +213,54 @@ class Volume:
             origin=origin,
             spacing=spacing,
             times=self.times[slices[0]],
+        )
+
+    def flip_spatial(self, *axes: str) -> Volume:
+        """Reverse named spatial axes while preserving each voxel's world position.
+
+        Axes are distinct names from ``s``, ``h``, ``w``. Like ``torch.flip``,
+        a nonempty flip copies tensor storage and retains autograd. No channel
+        components are transformed. An empty flip returns this volume.
+        """
+        if any(not isinstance(axis, str) or axis not in ("s", "h", "w") for axis in axes):
+            raise ValueError("spatial axes must be 's', 'h', or 'w'")
+        if len(set(axes)) != len(axes):
+            raise ValueError("spatial axes must not contain duplicates")
+        if not axes:
+            return self
+        indices = tuple("shw".index(axis) for axis in axes)
+        start = [self.shape[axis + 2] - 1 if axis in indices else 0 for axis in range(3)]
+        direction = np.array(self.direction)
+        direction[:, [2 - axis for axis in indices]] *= -1
+        return replace(
+            self,
+            tensor=self.tensor.flip(tuple(axis + 2 for axis in indices)),
+            origin=tuple(self.index_to_world(start)),
+            direction=tuple(tuple(row) for row in direction),
+        )
+
+    def permute_spatial(self, *order: str) -> Volume:
+        """Reorder SHW axes and their coordinates using a tensor view.
+
+        ``order`` contains ``s``, ``h``, ``w`` exactly once, naming the original
+        axes in the desired output order. T/C and channel components are kept.
+        The identity order returns this volume without constructing a wrapper.
+        """
+        if (
+            len(order) != 3
+            or any(not isinstance(axis, str) or axis not in ("s", "h", "w") for axis in order)
+            or len(set(order)) != 3
+        ):
+            raise ValueError("spatial order must contain 's', 'h', and 'w' exactly once")
+        if order == ("s", "h", "w"):
+            return self
+        indices = tuple("shw".index(axis) for axis in order)
+        direction = np.asarray(self.direction)[:, [2 - axis for axis in reversed(indices)]]
+        return replace(
+            self,
+            tensor=self.tensor.permute(0, 1, *(axis + 2 for axis in indices)),
+            spacing=tuple(self.spacing[axis] for axis in indices),
+            direction=tuple(tuple(row) for row in direction),
         )
 
     def index_to_world(self, shw: Any) -> np.ndarray:

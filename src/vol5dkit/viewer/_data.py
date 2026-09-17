@@ -8,25 +8,25 @@ import numpy as np
 import torch
 
 from ..volume import Volume
+from .._view import _validate_window
 
 
 @dataclass(frozen=True, slots=True)
 class Source:
     volume: Volume
     rgb: bool = False
-    ready: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Request:
     revision: int
-    slot: str
+    input_index: int
     source: Source
     positions: tuple[float, float, float, float]
     channel: int = 0
-    clim: tuple[float, float] | None = None
+    window: tuple[int | float, int | float] | None = None
     volume_3d: bool = False
-    preview_stride: int = 1
+    range_source: Source | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,14 +39,12 @@ class Plane:
 @dataclass(frozen=True, slots=True)
 class Frame:
     revision: int
-    slot: str
+    input_index: int
     source: Source
     indices: tuple[int, int, int, int, int]
     planes: tuple[Plane, ...]
-    clim: tuple[float, float] | None
-    volume: np.ndarray | None
-    preview_stride: int
-    transfer_bytes: int = 0
+    window: tuple[int | float, int | float] | None
+    volume_buffer: np.ndarray | None
 
 
 def relative_index(position: float, length: int) -> int:
@@ -59,18 +57,12 @@ def relative_index(position: float, length: int) -> int:
 
 
 def make_source(volume: Volume, rgb: bool = False) -> Source:
-    """Retain shared storage without retaining the caller's autograd graph.
-
-    Call this on the producing CUDA stream, or make the calling stream wait
-    for that producer before registering the data. Display preparation will
-    wait on the recorded event. Floating RGB ranges are checked only for the
-    pixels requested for display, never by scanning the full input here.
-    """
+    """Validate a loaded CPU snapshot without copying or scanning its data."""
     if not isinstance(volume, Volume):
         raise TypeError("viewer inputs must be Volume instances")
     tensor = volume.tensor
-    if tensor.device.type not in ("cpu", "cuda"):
-        raise ValueError("the viewer supports CPU and CUDA tensors")
+    if tensor.device.type != "cpu":
+        raise ValueError("display preparation requires a CPU snapshot")
     if tensor.is_complex() or tensor.is_quantized:
         raise TypeError("the viewer requires real, non-quantized data")
     if not isinstance(rgb, bool):
@@ -80,41 +72,78 @@ def make_source(volume: Volume, rgb: bool = False) -> Source:
             raise ValueError("RGB display requires exactly three channels")
         if tensor.dtype != torch.uint8 and not tensor.is_floating_point():
             raise TypeError("RGB display requires uint8 or floating point data")
-    detached = volume.with_data(tensor.detach())
-    ready = None
-    if tensor.device.type == "cuda":
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(tensor.device))
-    return Source(detached, rgb, ready)
+    return Source(volume, rgb)
 
 
-def _finite_range(tensor: torch.Tensor) -> tuple[float, float]:
-    """Reduce on the source device; transfer only the two scalar endpoints."""
-    if tensor.dtype == torch.uint64:
-        # Flip the sign bit so a signed reduction has unsigned ordering.
-        encoded = tensor.view(torch.int64) ^ torch.iinfo(torch.int64).min
-        low, high = torch.aminmax(encoded)
-        return low.item() + 2**63, high.item() + 2**63
-    if tensor.dtype in (torch.bool, torch.uint16, torch.uint32):
-        tensor = tensor.to(torch.int64)
-    low, high = torch.aminmax(tensor)
+_CHUNK_ELEMENTS = 1 << 20
+
+
+def _chunks(tensor: torch.Tensor):
+    """Yield slice indices and bounded views, including noncontiguous inputs."""
+    pending = [tuple(slice(0, n) for n in tensor.shape)]
+    while pending:
+        index = pending.pop()
+        chunk = tensor[index]
+        if chunk.numel() <= _CHUNK_ELEMENTS:
+            yield index, chunk
+            continue
+        axis = max(range(chunk.ndim), key=lambda i: chunk.shape[i])
+        start, stop = index[axis].start, index[axis].stop
+        middle = start + (stop - start) // 2
+        pending.append((*index[:axis], slice(middle, stop), *index[axis + 1:]))
+        pending.append((*index[:axis], slice(start, middle), *index[axis + 1:]))
+
+
+def _finite_range(tensor: torch.Tensor) -> tuple[int | float, int | float]:
+    """Reduce all TCSHW while bounding temporary allocations by chunk.
+
+    Ordinary finite data need only aminmax. The fallback masks and unsupported
+    integer casts stay bounded even for a large, noncontiguous volume. Chunk
+    endpoints retain the original integer precision.
+    """
+    unsigned64 = tensor.dtype == torch.uint64
+    cast_integer = tensor.dtype in (torch.bool, torch.uint16, torch.uint32)
+    if not unsigned64 and not cast_integer:
+        low, high = torch.aminmax(tensor)
+        lo, hi = low.item(), high.item()
+        if math.isfinite(lo) and math.isfinite(hi):
+            return lo, hi
+
+    low = high = None
+    for _, chunk in _chunks(tensor):
+        if unsigned64:
+            # Same-width view plus sign-bit flip preserves unsigned ordering.
+            encoded = chunk.view(torch.int64) ^ torch.iinfo(torch.int64).min
+            chunk_low, chunk_high = torch.aminmax(encoded)
+        elif cast_integer:
+            chunk_low, chunk_high = torch.aminmax(chunk.to(torch.int64))
+        else:
+            finite = torch.isfinite(chunk)
+            chunk_low = torch.where(finite, chunk, math.inf).amin()
+            chunk_high = torch.where(finite, chunk, -math.inf).amax()
+        low = chunk_low if low is None else torch.minimum(low, chunk_low)
+        high = chunk_high if high is None else torch.maximum(high, chunk_high)
+
     lo, hi = low.item(), high.item()
-    if math.isfinite(lo) and math.isfinite(hi):
-        return lo, hi
-    finite = torch.isfinite(tensor)
-    lo = torch.where(finite, tensor, math.inf).amin().item()
-    hi = torch.where(finite, tensor, -math.inf).amax().item()
+    if unsigned64:
+        return lo + 2**63, hi + 2**63
     return (lo, hi) if math.isfinite(lo) and math.isfinite(hi) else (0.0, 1.0)
 
 
-def _window(raw: torch.Tensor, clim: tuple[float, float]) -> np.ndarray:
-    """Window in original precision before creating a float32 texture."""
-    array = raw.to(torch.float64).numpy() if raw.dtype == torch.bfloat16 else raw.numpy()
-    lo, hi = clim
-    finite = np.isfinite(array)
-    if lo == hi:
-        output = np.full(array.shape, 0.5, dtype=np.float32)
-    else:
+def _window(
+    raw: torch.Tensor, window: tuple[int | float, int | float], *, nonfinite: float = np.nan
+) -> np.ndarray:
+    """Create an owned float32 texture with bounded precision-preserving work."""
+    result = np.empty(tuple(raw.shape), dtype=np.float32)
+    for index, chunk in _chunks(raw):
+        array = chunk.float().numpy() if raw.dtype == torch.bfloat16 else chunk.numpy()
+        output = result[index]
+        lo, hi = window
+        finite = np.isfinite(array)
+        if lo == hi:
+            output.fill(0.5)
+            output[~finite] = nonfinite
+            continue
         # Preserve narrow contrasts around large integer baselines. Casting
         # int64/uint64 directly to float64 first would lose low-order bits.
         integral_limits = isinstance(lo, Integral) and isinstance(hi, Integral)
@@ -123,9 +152,9 @@ def _window(raw: torch.Tensor, clim: tuple[float, float]) -> np.ndarray:
             lo, hi = int(lo), int(hi)
             limits = np.iinfo(array.dtype)
             if hi <= limits.min:
-                output = np.ones(array.shape, dtype=np.float32)
+                output.fill(1)
             elif lo >= limits.max:
-                output = np.zeros(array.shape, dtype=np.float32)
+                output.fill(0)
             else:
                 base, stop = max(lo, limits.min), min(hi, limits.max)
                 clipped = np.clip(array, base, stop)
@@ -136,7 +165,7 @@ def _window(raw: torch.Tensor, clim: tuple[float, float]) -> np.ndarray:
                 distance = clipped.astype(np.uint64) - baseline
                 width = hi - lo
                 normalized = distance.astype(np.float64) * (1 / width) + (base - lo) / width
-                output = np.asarray(normalized, dtype=np.float32)
+                output[...] = normalized
         else:
             work = array.astype(np.float64)
             with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
@@ -145,16 +174,15 @@ def _window(raw: torch.Tensor, clim: tuple[float, float]) -> np.ndarray:
                     normalized = (work - lo) / width
                 else:
                     normalized = (work / 2 - lo / 2) / (hi / 2 - lo / 2)
-            output = np.asarray(normalized, dtype=np.float32)
+            output[...] = normalized
         np.clip(output, 0, 1, out=output)
-    output[~finite] = np.nan
-    return np.ascontiguousarray(output)
+        output[~finite] = nonfinite
+    return result
 
 
 def _rgb_image(raw: torch.Tensor) -> np.ndarray:
-    image = raw.to(torch.float32).numpy()
-    # Keep image separately owned even if raw already has float32 dtype.
-    image = np.array(image, dtype=np.float32, order="C", copy=True)
+    # One cast/copy also owns storage when raw already has float32 dtype.
+    image = raw.to(dtype=torch.float32, copy=True, memory_format=torch.contiguous_format).numpy()
     if raw.dtype == torch.uint8:
         image /= 255.0
     else:
@@ -165,12 +193,12 @@ def _rgb_image(raw: torch.Tensor) -> np.ndarray:
     return image
 
 
-def prepare_frame(request: Request) -> Frame:
-    """Copy only the requested native slices, plus an opt-in 3D preview.
+def prepare_frame(request: Request, *, volume_buffer: np.ndarray | None = None) -> Frame:
+    """Prepare owned native slices and optionally normalize the selected 3D data.
 
-    This can run on a worker thread. The returned raw buffers own their CPU
-    storage even for CPU inputs. ``transfer_bytes`` counts image data copied
-    from CUDA to host, excluding the tiny initial range-reduction scalars.
+    A worker may supply its cached 3D buffer for the same input, T, C and
+    window. All preparation reads a CPU snapshot; CUDA transfer happens only
+    in the parent when that snapshot is created.
     """
     source = request.source
     tensor = source.volume.tensor
@@ -185,22 +213,17 @@ def prepare_frame(request: Request) -> Frame:
     c = 0 if source.rgb else int(request.channel)
     if not 0 <= c < tensor.shape[1]:
         raise ValueError("channel index is out of range")
-    stride = request.preview_stride
-    if isinstance(stride, bool) or not isinstance(stride, Integral) or stride < 1:
-        raise ValueError("preview_stride must be a positive integer")
     if request.volume_3d and source.rgb:
         raise ValueError("volume rendering supports scalar inputs only")
-    if source.ready is not None:
-        torch.cuda.current_stream(tensor.device).wait_event(source.ready)
-
     selected = tensor[t] if source.rgb else tensor[t, c]
-    clim = request.clim
+    window = _validate_window(request.window)
     if not source.rgb:
-        if clim is None:
-            clim = _finite_range(selected)
-        elif len(clim) != 2 or not all(math.isfinite(v) for v in clim) or clim[0] > clim[1]:
-            raise ValueError("clim must contain two finite values with low <= high")
-        clim = tuple(clim)
+        if window is None:
+            # A shared Auto action stays tied to the input selected when it
+            # was requested, even if newer navigation now displays another.
+            range_source = source if request.range_source is None else request.range_source
+            range_tensor = range_source.volume.tensor
+            window = _finite_range(range_tensor)
     if source.rgb:
         slices = (
             selected[:, s, :, :].permute(1, 2, 0),
@@ -211,32 +234,24 @@ def prepare_frame(request: Request) -> Frame:
         slices = (selected[s, :, :], selected[:, h, :], selected[:, :, w])
 
     planes = []
-    copied_bytes = 0
     for name, sliced in zip(("HW", "SW", "SH"), slices):
-        raw = sliced.to(device="cpu", copy=True, memory_format=torch.contiguous_format)
-        copied_bytes += raw.numel() * raw.element_size()
-        image = _rgb_image(raw) if source.rgb else _window(raw, clim)
+        raw = sliced.clone(memory_format=torch.contiguous_format)
+        image = _rgb_image(raw) if source.rgb else _window(raw, window)
         planes.append(Plane(name, raw, image))
 
-    volume = None
-    if request.volume_3d:
-        preview = selected[::stride, ::stride, ::stride].to(
-            device="cpu", copy=True, memory_format=torch.contiguous_format
-        )
-        copied_bytes += preview.numel() * preview.element_size()
-        volume = _window(preview, clim)
+    if not request.volume_3d:
+        volume_buffer = None
+    elif volume_buffer is None:
         # Nonfinite voxels are transparent/background in volume rendering;
         # slice views still expose them as NaNs with their original values.
-        np.nan_to_num(volume, copy=False, nan=0.0)
+        volume_buffer = _window(selected, window, nonfinite=0.0)
 
     return Frame(
         request.revision,
-        request.slot,
+        request.input_index,
         source,
         (t, c, s, h, w),
         tuple(planes),
-        clim,
-        volume,
-        int(stride),
-        copied_bytes if tensor.device.type == "cuda" else 0,
+        window,
+        volume_buffer,
     )

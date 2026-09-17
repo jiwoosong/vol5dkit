@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vol5dkit"
-version = "0.0.0.1"
+version = "0.0.0.2"
 description = "Lightweight TCSHW tensor geometry and native-slice volume comparison"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ dependencies = ["torch>=2.3", "numpy>=1.26"]
 
 [project.optional-dependencies]
 gui = ["PySide6-Essentials>=6.8,<7", "vispy>=0.17,<0.18", "PyOpenGL>=3.1.7"]
+colormaps = ["matplotlib>=3.6", "seaborn>=0.13"]
 test = ["pytest>=8"]
 dev = ["pytest>=8", "build>=1.2", "twine>=6"]
 
