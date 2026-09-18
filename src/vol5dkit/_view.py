@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from importlib.util import find_spec
 import json
 import math
 from numbers import Integral, Real
@@ -39,7 +40,7 @@ def _validate_window(value):
     return tuple(endpoints)
 
 
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(frozen=True, slots=True, eq=False, repr=False)
 class Display:
     """One viewer input with its name and display settings.
 
@@ -64,6 +65,13 @@ class Display:
         if not isinstance(self.rgb, bool):
             raise TypeError("rgb must be a bool")
         object.__setattr__(self, "window", _validate_window(self.window))
+
+    def __repr__(self):
+        device = "cpu" if isinstance(self.data, np.ndarray) else self.data.device
+        return (
+            f"Display(shape={tuple(self.data.shape)}, dtype={self.data.dtype}, device={device}, "
+            f"name={self.name!r}, window={self.window!r}, cmap={self.cmap!r}, rgb={self.rgb})"
+        )
 
 
 def _normalize_inputs(inputs):
@@ -259,6 +267,14 @@ def _launch(inputs, *, window=None, interpolation="nearest", smoke=False, screen
         raise ValueError("interpolation must be 'nearest' or 'linear'")
     if isinstance(iterations, bool) or not isinstance(iterations, Integral) or iterations < 1:
         raise ValueError("diagnostic iterations must be a positive integer")
+    # Check top-level packages without importing Qt or touching tensor values.
+    # Runtime/backend initialization still belongs to the child process.
+    for module in ("PySide6", "vispy", "OpenGL"):
+        if find_spec(module) is None:
+            raise ImportError(
+                f"The viewer requires the gui extra (missing {module}). "
+                'From a checkout, run: python -m pip install ".[gui]"'
+            )
     directory = Path(tempfile.mkdtemp(prefix="vol5dkit-"))
     try:
         manifest = _write_snapshot(inputs, directory, window=window, interpolation=interpolation, started=started)

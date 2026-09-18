@@ -29,6 +29,14 @@ jobs:
             python: "3.11"
             torch: "torch"
             numpy: "numpy"
+          - os: ubuntu-latest
+            python: "3.12"
+            torch: "torch"
+            numpy: "numpy"
+          - os: ubuntu-latest
+            python: "3.13"
+            torch: "torch"
+            numpy: "numpy"
           - os: windows-latest
             python: "3.11"
             torch: "torch"
@@ -82,7 +90,7 @@ jobs:
   distributions:
     name: Wheel and source distribution
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -93,6 +101,15 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check --strict dist/*
+      - name: Test installed wheel outside the checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-env"
+          wheel_python="$RUNNER_TEMP/wheel-env/bin/python"
+          "$wheel_python" -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          "$wheel_python" -m pip install dist/*.whl
+          unset PYTHONPATH
+          cd "$RUNNER_TEMP"
+          "$wheel_python" -I "$GITHUB_WORKSPACE/tests/smoke_installed.py"
       - uses: actions/upload-artifact@v4
         with:
           name: distributions

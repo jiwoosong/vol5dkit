@@ -9,10 +9,10 @@ axis guessing, automatic dimension insertion, or tensor-subclass dispatch.
 
 ```python
 import torch
-import vol5dkit as v5
+import vol5dkit as v5d
 
 x = torch.zeros(2, 1, 8, 16, 16)
-a = v5.Volume(
+a = v5d.Volume(
     x,
     spacing=(2, 1, 1),       # S, H, W
     origin=(10, 20, 30),     # X, Y, Z of voxel (0, 0, 0)
@@ -44,7 +44,7 @@ return CPU float64 NumPy arrays without rounding or clamping.
 
 ```python
 y = a.tensor.square()          # ordinary PyTorch; no metadata hooks
-b = v5.Volume(y, ref=a)        # coordinates are attached explicitly
+b = v5d.Volume(y, ref=a)        # coordinates are attached explicitly
 ```
 
 | Result compared with `ref` | Behavior |
@@ -75,7 +75,7 @@ including rotated, reflected, anisotropic, and singleton grids.
 import torch.nn.functional as F
 
 y = F.interpolate(a.tensor, scale_factor=2, mode="trilinear", align_corners=False)
-upsampled = v5.Volume(y, ref=a)
+upsampled = v5d.Volume(y, ref=a)
 ```
 
 Interpolation above is an explicit processing operation. Wrapping the result
@@ -112,21 +112,51 @@ Crop and permutation use views where possible. Flip copies as `torch.flip`
 does. These operations do not interpolate, force contiguity, or change dtype or
 device. Resampling, warping, and padding are left to processing code.
 
-### Ownership and conversion
+### Ownership and tensor state
 
 | Operation | Data behavior |
 | --- | --- |
 | `Volume(tensor)` / `Volume(result, ref=a)` | Retains the native tensor, strides, device, dtype, and autograd graph |
-| `Volume(array)` | Shares compatible writable NumPy storage |
 | `a.to(...)` | Follows `Tensor.to()` and retains coordinates |
 | `a.clone()` | Copies tensor storage and retains coordinates |
-| `a.numpy(copy=False)` | Detaches; shares CPU storage where possible, copies other devices to CPU |
-| `a.numpy(copy=True)` | Returns independent NumPy storage |
-| `Volume.from_dlpack(obj, **coordinates)` | Shares external storage without promising to import an external autograd graph |
+| `a.detach()` | Detaches the returned tensor from autograd, shares storage, and retains coordinates |
+| `a.cpu(memory_format=torch.preserve_format)` | Follows `Tensor.cpu()` and retains coordinates |
+| `a.cuda(device=None, non_blocking=False, memory_format=torch.preserve_format)` | Follows `Tensor.cuda()` and retains coordinates |
+| `a.contiguous(memory_format=torch.contiguous_format)` | Follows `Tensor.contiguous()` and retains coordinates |
 
-Read-only or negative-stride NumPy inputs require an explicit copy. Unsupported
-dtypes are not silently converted; cast bfloat16 explicitly before NumPy export.
-Lazy conjugate or negative views may need materialization during NumPy export.
+Each state-change method returns a new wrapper. Tensor copies follow PyTorch:
+for example, `.cpu()` on an existing CPU tensor and `.contiguous()` on an
+already contiguous tensor can retain the same tensor. `.detach()` shares storage;
+add `.clone()` when independent data is required. Except for `.detach()`, these
+methods do not implicitly detach the result from its graph.
+
+```python
+gpu = a.cuda()                     # requires an available CUDA device
+fp16 = gpu.to(dtype=torch.float16)
+detached = gpu.detach()            # shares storage, no autograd graph
+independent = gpu.detach().clone() # independent storage, no autograd graph
+a = gpu.cpu()                     # reassign the variable to the new wrapper
+packed = a.contiguous()
+```
+
+Use the native tensor for gradient settings and queries. These methods are not
+forwarded implicitly through the wrapper:
+
+```python
+trainable = v5d.Volume(a.tensor.detach().requires_grad_(True), ref=a)
+trainable.tensor.requires_grad_(False)  # allowed here: this tensor is a leaf
+trainable.tensor.grad = None           # clear accumulated gradient only
+
+with torch.no_grad():
+    y = a.tensor.square()              # replace with your processing code
+result = v5d.Volume(y, ref=a)
+```
+
+`requires_grad_(False)` changes a leaf tensor's tracking flag. For a non-leaf
+result of a recorded operation, use `.detach()` to separate it from its graph.
+`torch.no_grad()` controls recording of new operations; it does not detach an
+existing tensor. Floating or complex tensors can require gradients. Detached
+tensors still share data, so writes through one reference affect the other.
 
 The frozen wrapper prevents field reassignment, not tensor writes. Structural
 in-place changes such as `resize_()`, `set_()`, and `transpose_()` are unsupported
@@ -139,18 +169,78 @@ checking tensor structure and time count, without rescanning all times. A
 reference object is not retained. Subclass references are validated normally.
 
 Dataclass subclasses may add fields and validation. Their generated constructors
-do not automatically acquire the base constructor's `ref` argument. Existing
-`.to()`, `.clone()`, and spatial operations use `dataclasses.replace()` for
-subclasses, preserving extra fields and running their validation.
+do not automatically acquire the base constructor's `ref` argument. State-change
+methods and spatial operations use `dataclasses.replace()` for subclasses,
+preserving extra fields and running their validation.
+
+### Array exchange
+
+| Operation | Data behavior |
+| --- | --- |
+| `a.tensor` | Returns the same native tensor without copying, detaching, or synchronizing |
+| `Volume(array)` | Shares compatible writable NumPy storage |
+| `a.numpy(copy=False)` | Detaches; shares CPU storage where possible, copies other devices to CPU |
+| `a.numpy(copy=True)` | Returns independent NumPy storage |
+| `Volume.from_dlpack(obj, ref=a)` | Shares compatible external storage and assigns coordinates from `a` |
+
+Array inputs must already be nonempty TCSHW. Read-only or negative-stride NumPy
+inputs require an explicit copy. Other dtype and stride constraints follow
+`torch.from_numpy()`. Unsupported dtypes are not silently converted; cast
+bfloat16 explicitly before NumPy export. Lazy conjugate or negative views may
+need materialization during NumPy export. Shared arrays expose the same storage,
+so writes can affect the original tensor; use a copy if that is not intended.
+
+CuPy is optional and uses DLPack directly. With CuPy installed and a compatible
+CUDA tensor:
+
+```python
+import cupy as cp
+
+gpu = a.cuda()
+array = cp.from_dlpack(gpu.tensor.detach())  # shares CUDA storage
+processed = cp.square(array)
+result = v5d.Volume.from_dlpack(processed, ref=gpu)
+```
+
+DLPack transfers array data without preserving coordinates or the producer's
+autograd graph. Here `ref=gpu` explicitly reconnects the coordinates; it does
+not reconnect gradients through CuPy. The same T and spatial reference rules
+apply as for `Volume(tensor, ref=...)`. Omit `ref` for default coordinates or
+supply explicit coordinate arguments. vol5dkit does not require CuPy or expose
+a separate CuPy backend.
+
+### Domain headers
+
+A library can keep a `Volume` and its own header together without subclassing:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class Sample:
+    volume: v5d.Volume
+    header: dict[str, str]
+
+sample = Sample(a, {"source_id": "simulation-42"})
+y = sample.volume.tensor.square()
+processed = Sample(v5d.Volume(y, ref=sample.volume), sample.header.copy())
+```
+
+The header above contains only a source identifier, which remains valid after
+this operation. Volume is the source of truth for geometry and times; avoid
+duplicating those values in a mutable header. The owning library decides which
+provenance to retain, how channel or frame descriptions change, and when cached
+statistics must be invalidated. vol5dkit does not infer rules for arbitrary
+headers, including extra subclass fields.
 
 ## Display options
 
 ```python
-residual = v5.Volume(b.tensor - a.tensor, ref=a)
-viewer = v5.view(
-    v5.Display(a, name="original", window=(0, 1)),
-    v5.Display(b, name="processed", window=(0, 1)),
-    v5.Display(residual, name="difference", cmap="mpl:coolwarm"),
+residual = v5d.Volume(b.tensor - a.tensor, ref=a)
+viewer = v5d.view(
+    v5d.Display(a, name="original", window=(0, 1)),
+    v5d.Display(b, name="processed", window=(0, 1)),
+    v5d.Display(residual, name="difference", cmap="mpl:coolwarm"),
 )
 ```
 
@@ -238,7 +328,7 @@ Each `view()` call creates a new process and returns after snapshot saving and
 process launch, without waiting for first rendering or window closure:
 
 ```python
-viewer = v5.view(a, b)
+viewer = v5d.view(a, b)
 print(viewer.pid)
 print(viewer.poll())       # None while running, otherwise the exit code
 print(viewer.log_path)     # diagnostics when child startup fails
@@ -275,6 +365,38 @@ log while releasing snapshot data. Forced process termination may leave files.
 Local Jupyter/IPython works with ordinary `view(...)`; `%gui qt6` is unnecessary
 because the GUI event loop runs separately. This is a local desktop window,
 not an inline or remote notebook widget.
+
+## Linux viewer troubleshooting
+
+The Qt X11 (`xcb`) backend needs system libraries in addition to the Python
+GUI extra. If startup reports that `xcb-cursor0` or `libxcb-cursor0` is needed,
+install the Ubuntu/Debian runtime package and rerun the script:
+
+```bash
+sudo apt update
+sudo apt install libxcb-cursor0
+```
+
+Other missing libraries can also prevent the plugin from loading. If the
+error persists, set `QT_DEBUG_PLUGINS=1` for the process and inspect
+`viewer.log_path` for the specific loader error. See
+[Qt's Linux requirements](https://doc.qt.io/qt-6/linux-requirements.html).
+
+For a black image area under Wayland, compare the same input using X11:
+
+```bash
+QT_QPA_PLATFORM=xcb python your_script.py
+```
+
+This is a diagnostic comparison, not a guarantee that Wayland caused the
+problem. It requires the XCB libraries and an available X11/XWayland display.
+The Linux GUI CI uses X11 and Mesa software rendering; it does not cover every
+Wayland or GPU driver combination.
+
+Read the log after the child has had time to start, while the window is still
+open or after a failed exit. `view()` returns before the first draw, so an
+immediately empty log does not prove rendering succeeded. Normal closure and
+`close()` may remove the log.
 
 See [API migration and development](development.md) and
 [optional interoperability](interop.md).

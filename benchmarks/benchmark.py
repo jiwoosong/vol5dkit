@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 
-import vol5dkit as v5
+import vol5dkit as v5d
 from vol5dkit._view import _load_snapshot, _normalize_inputs, _write_snapshot
 from vol5dkit.viewer._data import Request, make_source, prepare_frame
 
@@ -57,22 +57,22 @@ def core_benchmark(device, iterations):
     coordinates = []
     for frames in (1, 1000, 100000):
         tensor = torch.empty((frames, 1, 1, 1, 1), device=device)
-        ref = v5.Volume(tensor)
+        ref = v5d.Volume(tensor)
         coordinates.append({
             "T": frames,
-            "construct_default_times": measure(lambda: v5.Volume(tensor), 10),
+            "construct_default_times": measure(lambda: v5d.Volume(tensor), 10),
             "construct_existing_coordinates": measure(
-                lambda: v5.Volume(tensor, spacing=ref.spacing, origin=ref.origin,
+                lambda: v5d.Volume(tensor, spacing=ref.spacing, origin=ref.origin,
                                   direction=ref.direction, times=ref.times), 10
             ),
-            "reference_same_grid": measure(lambda: v5.Volume(tensor, ref=ref), 200),
+            "reference_same_grid": measure(lambda: v5d.Volume(tensor, ref=ref), 200),
         })
 
-    ref = v5.Volume(torch.rand((1, 1, 16, 32, 32), device=device), spacing=(2, 1, 0.5))
+    ref = v5d.Volume(torch.rand((1, 1, 16, 32, 32), device=device), spacing=(2, 1, 0.5))
     resized = torch.empty((1, 1, 32, 64, 64), device=device)
     spatial = {
         "shape_tcshw": list(ref.shape),
-        "attach_changed_grid": measure(lambda: v5.Volume(resized, ref=ref), 200),
+        "attach_changed_grid": measure(lambda: v5d.Volume(resized, ref=ref), 200),
         "crop_view": measure(lambda: ref.crop(s=slice(1, None, 2)), 200),
         "permute_view": measure(lambda: ref.permute_spatial("w", "s", "h"), 200),
         "flip_copy": measure(lambda: ref.flip_spatial("s", "w"), 200),
@@ -84,7 +84,7 @@ def core_benchmark(device, iterations):
         torch.nn.Conv3d(4, 1, 3, padding=1),
     ).to(device).eval()
     tensor = ref.tensor.detach().requires_grad_()
-    volume = v5.Volume(tensor, ref=ref)
+    volume = v5d.Volume(tensor, ref=ref)
     direct = model(tensor)
     via_volume = model(volume.tensor)
     torch.testing.assert_close(direct, via_volume)
@@ -128,7 +128,7 @@ def gui_benchmark(volume, rgb, iterations, volume_3d=False):
         report_path = Path(directory) / "timings.json"
         started = time.perf_counter()
         viewer = _launch(
-            [v5.Display(volume, rgb=rgb)],
+            [v5d.Display(volume, rgb=rgb)],
             smoke=True, report=report_path, iterations=iterations, volume_3d=volume_3d,
         )
         returned_ms = (time.perf_counter() - started) * 1000
@@ -156,12 +156,12 @@ def gui_benchmark(volume, rgb, iterations, volume_3d=False):
 def benchmark_case(name, device, iterations, gui=False, volume_3d=False):
     shape, rgb = CASES[name]
     torch.manual_seed(0)
-    volume = v5.Volume(torch.rand(shape, device=device, dtype=torch.float32))
+    volume = v5d.Volume(torch.rand(shape, device=device, dtype=torch.float32))
     synchronize(device)
     volume_3d = volume_3d and not rgb
     with tempfile.TemporaryDirectory(prefix="vol5dkit-benchmark-") as directory:
         # Exercise the public transport: complete CPU snapshot, file write, mmap.
-        manifest = _write_snapshot(_normalize_inputs([v5.Display(volume, rgb=rgb)]), directory)
+        manifest = _write_snapshot(_normalize_inputs([v5d.Display(volume, rgb=rgb)]), directory)
         started = time.perf_counter()
         inputs, transport = _load_snapshot(manifest)
         load_ms = (time.perf_counter() - started) * 1000
@@ -228,7 +228,7 @@ def main():
             "platform": platform.platform(),
             "torch": torch.__version__,
             "numpy": np.__version__,
-            "vol5dkit": v5.__version__,
+            "vol5dkit": v5d.__version__,
             "device": args.device,
             "gpu": torch.cuda.get_device_name() if args.device == "cuda" else None,
         },

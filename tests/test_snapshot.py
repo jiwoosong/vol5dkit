@@ -32,6 +32,37 @@ def test_display_are_small_immutable_and_preserve_integer_endpoints():
         options.rgb = True
 
 
+def test_display_repr_does_not_read_data_values(monkeypatch):
+    def forbidden_repr(self):
+        raise AssertionError("Display repr must not format data values")
+
+    class Array(np.ndarray):
+        __repr__ = forbidden_repr
+
+    volume = sample()
+    array = volume.numpy().view(Array)
+    monkeypatch.setattr(torch.Tensor, "__repr__", forbidden_repr)
+    monkeypatch.setattr(Volume, "__repr__", forbidden_repr)
+    for data in (volume, volume.tensor, array):
+        result = repr(Display(data, name="original", window=(0, 1)))
+        assert "shape=(2, 1, 2, 3, 4)" in result
+        assert "dtype=" in result and "device=cpu" in result
+        assert "name='original'" in result and "window=(0, 1)" in result
+
+
+@pytest.mark.parametrize("missing", ["PySide6", "vispy", "OpenGL"])
+def test_missing_gui_fails_before_staging_or_starting_process(monkeypatch, missing):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("missing GUI must fail before snapshot or process creation")
+
+    monkeypatch.setattr(_view, "find_spec", lambda name: None if name == missing else object())
+    monkeypatch.setattr(_view.tempfile, "mkdtemp", unexpected)
+    monkeypatch.setattr(_view, "_write_snapshot", unexpected)
+    monkeypatch.setattr(_view.subprocess, "Popen", unexpected)
+    with pytest.raises(ImportError, match=f"missing {missing}"):
+        view(sample())
+
+
 @pytest.mark.parametrize("kwargs", [
     {"name": 3}, {"rgb": 1}, {"cmap": ""}, {"window": (2, 1)}, {"window": (0, float("nan"))},
     {"window": (0, float("inf"))}, {"window": (True, 1)}, {"window": (1,)}, {"window": "ab"},
@@ -189,6 +220,7 @@ def test_launch_uses_local_debugger_context_and_owned_log(tmp_path, monkeypatch)
         return process
 
     monkeypatch.setitem(sys.modules, "_pydev_bundle.pydev_monkey", SimpleNamespace(skip_subprocess_arg_patch=skip_patch))
+    monkeypatch.setattr(_view, "find_spec", lambda name: object())
     monkeypatch.setattr(_view.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
     monkeypatch.setattr(_view.subprocess, "Popen", popen)
     handle = _view._launch([sample()])
@@ -229,6 +261,7 @@ def test_public_debugger_context_is_preferred(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pydevd", SimpleNamespace(skip_subprocess_arg_patch=public_context))
     monkeypatch.setitem(sys.modules, "_pydev_bundle.pydev_monkey", SimpleNamespace(skip_subprocess_arg_patch=unexpected_private_context))
+    monkeypatch.setattr(_view, "find_spec", lambda name: object())
     monkeypatch.setattr(_view.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
     monkeypatch.setattr(_view.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     handle = _view._launch([sample()])
@@ -237,6 +270,7 @@ def test_public_debugger_context_is_preferred(tmp_path, monkeypatch):
 
 
 def test_parent_launch_failure_removes_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(_view, "find_spec", lambda name: object())
     monkeypatch.setattr(_view.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
 
     def fail(*args, **kwargs):
@@ -327,6 +361,10 @@ def test_real_child_startup_failure_retains_traceback_and_releases_snapshot():
         _view._cleanup_snapshot(handle.log_path.parent)
 
 
+@pytest.mark.skipif(
+    any(_view.find_spec(name) is None for name in ("PySide6", "vispy", "OpenGL")),
+    reason="GUI dependencies are required to launch the child",
+)
 def test_real_handle_close_during_startup_is_idempotent():
     for _ in range(2):
         handle = view(sample())

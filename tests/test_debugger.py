@@ -89,7 +89,7 @@ from pathlib import Path
 import sys
 import debugpy
 import torch
-import vol5dkit as v5
+import vol5dkit as v5d
 import vol5dkit._view as process_view
 
 directory = Path(sys.argv[1])
@@ -100,8 +100,8 @@ def diagnostic_launch(inputs, **kwargs):
     (directory / "handle-log.txt").write_text(str(handle.log_path), encoding="utf-8")
     return handle
 process_view._launch = diagnostic_launch
-a = v5.Volume(torch.arange(2 * 3 * 4 * 5, dtype=torch.float64).reshape(2, 1, 3, 4, 5))
-b = v5.Volume(a.tensor * 0.5, ref=a)
+a = v5d.Volume(torch.arange(2 * 3 * 4 * 5, dtype=torch.float64).reshape(2, 1, 3, 4, 5))
+b = v5d.Volume(a.tensor * 0.5, ref=a)
 endpoint = debugpy.listen(("127.0.0.1", 0))
 (directory / "address.json").write_text(json.dumps(endpoint), encoding="utf-8")
 debugpy.wait_for_client()
@@ -134,7 +134,7 @@ assert all(name not in sys.modules for name in ("PySide6", "vispy", "OpenGL"))
                      if Path(item.get("source", {}).get("path", "")) == target)
         # This invokes the actual public view at a breakpoint. The private
         # launch wrapper only enables child-owned diagnostics and auto-close.
-        client.response(client.send("evaluate", expression="viewer = v5.view(a, b)",
+        client.response(client.send("evaluate", expression="viewer = v5d.view(a, b)",
                                     frameId=frame["id"], context="repl"))
         _wait_for_file(report, process, target_log)
         results = json.loads(report.read_text(encoding="utf-8"))

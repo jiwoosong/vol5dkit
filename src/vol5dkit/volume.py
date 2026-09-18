@@ -63,6 +63,7 @@ class Volume:
 
     Freezing prevents field reassignment, not tensor writes. Structural in-place
     mutations such as resize_(), set_(), and transpose_() are unsupported.
+    State changes return new wrappers; tensor copies follow PyTorch semantics.
     """
 
     tensor: torch.Tensor
@@ -169,6 +170,44 @@ class Volume:
     def clone(self, **kwargs: Any) -> Volume:
         """Clone tensor storage with Tensor.clone(), retaining coordinates."""
         tensor = self.tensor.clone(**kwargs)
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
+
+    def detach(self) -> Volume:
+        """Return a new volume detached from autograd, sharing tensor storage."""
+        tensor = self.tensor.detach()
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
+
+    def cpu(self, *, memory_format: torch.memory_format = torch.preserve_format) -> Volume:
+        """Return a CPU volume, retaining coordinates and autograd.
+
+        Tensor.cpu() copies only when device or memory format requires it.
+        The wrapper is new even when the tensor is unchanged.
+        """
+        tensor = self.tensor.cpu(memory_format=memory_format)
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
+
+    def cuda(
+        self,
+        device: torch.device | str | int | None = None,
+        non_blocking: bool = False,
+        *,
+        memory_format: torch.memory_format = torch.preserve_format,
+    ) -> Volume:
+        """Return a CUDA volume using Tensor.cuda() device and copy semantics.
+
+        Coordinates and autograd are retained. The wrapper is new even when
+        the tensor is unchanged; non_blocking has the native Torch meaning.
+        """
+        tensor = self.tensor.cuda(device=device, non_blocking=non_blocking, memory_format=memory_format)
+        return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
+
+    def contiguous(self, *, memory_format: torch.memory_format = torch.contiguous_format) -> Volume:
+        """Return a new volume with the requested contiguous tensor layout.
+
+        Tensor.contiguous() copies only when needed. Coordinates and autograd
+        are retained, including when the tensor is already in this layout.
+        """
+        tensor = self.tensor.contiguous(memory_format=memory_format)
         return Volume(tensor, ref=self) if type(self) is Volume else replace(self, tensor=tensor)
 
     def numpy(self, copy: bool = False) -> np.ndarray:

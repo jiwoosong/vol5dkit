@@ -135,6 +135,60 @@ def test_clone_and_to_follow_tensor_semantics():
     torch.testing.assert_close(x.grad, torch.ones_like(x))
 
 
+def test_detach_shares_storage_and_strides_without_retaining_autograd():
+    leaf = torch.randn(2, 3, 4, 5, 6, requires_grad=True)
+    tensor = (leaf * 3).transpose(-1, -2)
+    volume = Volume(tensor)
+    detached = volume.detach()
+    assert detached is not volume
+    assert detached.tensor is not tensor
+    assert detached.tensor.data_ptr() == tensor.data_ptr()
+    assert detached.tensor.stride() == tensor.stride()
+    assert not detached.tensor.requires_grad
+    assert detached.tensor.grad_fn is None
+    assert tensor.grad_fn is not None
+    tensor.sum().backward()
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 3))
+    independent = detached.clone()
+    assert independent.tensor.data_ptr() != tensor.data_ptr()
+    assert not independent.tensor.requires_grad
+    expected = independent.tensor.clone()
+    detached.tensor.add_(1)
+    torch.testing.assert_close(tensor, expected + 1)
+    torch.testing.assert_close(independent.tensor, expected)
+
+
+@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
+def test_contiguous_converts_layout_preserving_values_and_autograd(memory_format):
+    leaf = torch.randn(2, 3, 4, 5, 6, requires_grad=True)
+    tensor = leaf.transpose(-1, -2)
+    volume = Volume(tensor)
+    result = volume.contiguous(memory_format=memory_format)
+    assert result.tensor.is_contiguous(memory_format=memory_format)
+    assert result.tensor.data_ptr() != tensor.data_ptr()
+    assert result.dtype == volume.dtype
+    assert result.device == volume.device
+    torch.testing.assert_close(result.tensor, tensor)
+    unchanged = result.contiguous(memory_format=memory_format)
+    assert unchanged is not result
+    assert unchanged.tensor is result.tensor
+    result.tensor.sum().backward()
+    torch.testing.assert_close(leaf.grad, torch.ones_like(leaf))
+
+
+def test_cpu_noop_retains_tensor_and_graph_in_a_new_wrapper():
+    leaf = torch.ones(2, 3, 4, 5, 6, requires_grad=True)
+    tensor = (leaf * 2).transpose(-1, -2)
+    volume = Volume(tensor)
+    result = volume.cpu()
+    assert result is not volume
+    assert result.tensor is tensor
+    assert result.device.type == "cpu"
+    assert result.tensor.stride() == tensor.stride()
+    result.tensor.sum().backward()
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
+
+
 def test_numpy_sharing_noncontiguous_inputs_and_explicit_copy():
     array = np.arange(2 * 3 * 4, dtype=np.float64).reshape(1, 1, 2, 3, 4)
     array = array.swapaxes(-1, -2)
@@ -169,6 +223,59 @@ def test_dlpack_shares_storage_without_graph():
     assert volume.spacing == (2.0, 3.0, 4.0)
     volume.tensor.add_(2)
     torch.testing.assert_close(x, torch.full_like(x, 3))
+    reconnected = Volume.from_dlpack(volume.tensor, ref=volume)
+    assert reconnected.tensor.data_ptr() == x.data_ptr()
+    for name in ("spacing", "origin", "direction", "times"):
+        assert getattr(reconnected, name) is getattr(volume, name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cupy_dlpack_shares_cuda_storage_and_coordinates_with_explicit_clone():
+    cupy = pytest.importorskip("cupy")
+    array = cupy.arange(120, dtype=cupy.float32).reshape(1, 2, 3, 4, 5)
+    reference = Volume(torch.empty(array.shape), spacing=(2, 3, 4), origin=(7, 8, 9), times=(5,))
+    volume = Volume.from_dlpack(array, ref=reference)
+    assert volume.device.type == "cuda"
+    assert volume.dtype == torch.float32
+    assert volume.tensor.data_ptr() == array.data.ptr
+    assert not volume.tensor.requires_grad
+    exported = cupy.from_dlpack(volume.tensor.detach())
+    assert exported.data.ptr == volume.tensor.data_ptr()
+    for name in ("spacing", "origin", "direction", "times"):
+        assert getattr(volume, name) is getattr(reference, name)
+    volume.tensor.add_(1)
+    torch.cuda.synchronize()
+    np.testing.assert_array_equal(cupy.asnumpy(array), np.arange(1, 121).reshape(array.shape))
+    independent = volume.clone()
+    assert independent.tensor.data_ptr() != array.data.ptr
+    volume.tensor.zero_()
+    torch.testing.assert_close(
+        independent.tensor, torch.arange(1, 121, device=volume.device, dtype=volume.dtype).reshape(volume.shape),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cupy_dlpack_preserves_strides_and_hands_off_nondefault_streams():
+    cupy = pytest.importorskip("cupy")
+    cupy_stream = cupy.cuda.Stream(non_blocking=True)
+    torch_stream = torch.cuda.Stream()
+    # Keep each producer's stream current at the DLPack exchange boundary.
+    # The protocol connects the two streams without a device-wide barrier.
+    with cupy_stream, torch.cuda.stream(torch_stream):
+        base = cupy.arange(2 * 2 * 3 * 4 * 512, dtype=cupy.float32).reshape(2, 2, 3, 4, 512)
+        array = base[..., 1::2]
+        volume = Volume.from_dlpack(array)
+        assert not volume.tensor.is_contiguous()
+        assert volume.tensor.data_ptr() == array.data.ptr
+        assert tuple(stride * array.itemsize for stride in volume.tensor.stride()) == array.strides
+        volume.tensor.add_(3)
+        exported = cupy.from_dlpack(volume.tensor.detach())
+        assert exported.data.ptr == array.data.ptr
+        assert exported.strides == array.strides
+        copied = exported.copy()
+    cupy_stream.synchronize()
+    expected = np.arange(base.size, dtype=np.float32).reshape(base.shape)[..., 1::2] + 3
+    np.testing.assert_array_equal(cupy.asnumpy(copied), expected)
 
 
 def test_continuous_coordinates_match_the_defined_transform_and_round_trip():
@@ -241,6 +348,31 @@ def test_cuda_storage_autograd_numpy_and_dlpack():
     result = Volume(x * 2, ref=volume)
     assert result.tensor.grad_fn is not None
     assert volume.to("cpu").device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_cpu_round_trip_preserves_autograd_coordinates_and_memory_format():
+    leaf = torch.randn(2, 3, 4, 5, 6, requires_grad=True)
+    volume = Volume(leaf, spacing=(2, 3, 4), times=(5, 1))
+    device = torch.device("cuda", torch.cuda.current_device())
+    gpu = volume.cuda(device=device, non_blocking=True, memory_format=torch.channels_last_3d)
+    assert gpu.device == device
+    assert gpu.dtype == volume.dtype
+    assert gpu.tensor.is_contiguous(memory_format=torch.channels_last_3d)
+    assert gpu.tensor.grad_fn is not None
+    unchanged = gpu.cuda(device=device)
+    assert unchanged is not gpu
+    assert unchanged.tensor is gpu.tensor
+    cpu = gpu.cpu(memory_format=torch.contiguous_format)
+    assert cpu.device.type == "cpu"
+    assert cpu.tensor.is_contiguous()
+    assert cpu.tensor.data_ptr() != leaf.data_ptr()
+    torch.testing.assert_close(cpu.tensor, leaf)
+    for result in (gpu, unchanged, cpu):
+        for name in ("spacing", "origin", "direction", "times"):
+            assert getattr(result, name) is getattr(volume, name)
+    cpu.tensor.sum().backward()
+    torch.testing.assert_close(leaf.grad, torch.ones_like(leaf))
 
 
 def test_reference_defaults_and_same_grid_retain_tensor_metadata_and_graph():
@@ -337,9 +469,14 @@ def test_same_grid_reuse_does_not_repeat_coordinate_validation(monkeypatch):
         raise AssertionError("same-grid metadata must not be rescanned")
 
     monkeypatch.setattr(module, "_float_tuple", unexpected_validation)
-    for result in (Volume(reference.tensor, ref=reference), reference.clone(), reference.to(torch.float64)):
+    for result in (
+        Volume(reference.tensor, ref=reference), reference.clone(), reference.to(torch.float64),
+        reference.detach(), reference.cpu(), reference.contiguous(),
+    ):
         assert result.times is reference.times
         assert result.direction is reference.direction
+    if torch.cuda.is_available():
+        assert reference.cuda().times is reference.times
 
 
 def test_base_constructor_validates_coordinates_from_subclass_references():
@@ -375,7 +512,9 @@ def test_same_grid_reuse_still_validates_native_dense_nonempty_tensor(invalid):
 
 def test_same_grid_methods_share_all_coordinate_tuples():
     reference = Volume(torch.ones(3, 1, 2, 3, 4), times=(1, 7, -3))
-    for result in (reference.to(torch.float64), reference.clone(), Volume(reference.tensor.detach(), ref=reference)):
+    for result in (
+        reference.to(torch.float64), reference.clone(), reference.detach(), reference.cpu(), reference.contiguous(),
+    ):
         assert result is not reference
         for name in ("spacing", "origin", "direction", "times"):
             assert getattr(result, name) is getattr(reference, name)
@@ -399,8 +538,11 @@ def test_subclass_extra_fields_and_validation_are_preserved():
     reference = LabeledVolume(torch.ones(1, 1, 2, 3, 4), label="A", maximum=3)
     results = (
         replace(reference, tensor=reference.tensor + 1), reference.to(torch.float64), reference.clone(),
+        reference.detach(), reference.cpu(), reference.contiguous(),
         reference.crop(s=slice(1, None)), reference.flip_spatial("s"), reference.permute_spatial("w", "s", "h"),
     )
+    if torch.cuda.is_available():
+        results += (reference.cuda(),)
     for result in results:
         assert type(result) is LabeledVolume
         assert result.label == "A"
@@ -411,10 +553,14 @@ def test_subclass_extra_fields_and_validation_are_preserved():
     with pytest.raises(TypeError, match="ref"):
         LabeledVolume(reference.tensor, ref=reference)
     reference.tensor.fill_(4)
-    with pytest.raises(ValueError, match="maximum exceeded"):
-        reference.clone()
+    for method in (reference.clone, reference.detach, reference.cpu, reference.contiguous):
+        with pytest.raises(ValueError, match="maximum exceeded"):
+            method()
     with pytest.raises(ValueError, match="maximum exceeded"):
         reference.to(torch.float64)
+    if torch.cuda.is_available():
+        with pytest.raises(ValueError, match="maximum exceeded"):
+            reference.cuda()
     assert type(Volume(reference.tensor, ref=reference)) is Volume
 
 
