@@ -122,7 +122,7 @@ GUI before publication. Building and checking artifacts does not publish them.
 The package uses MIT; dependency licenses remain separate.
 
 Development goes to `dev-internal`, then merges into `master`. Release tags
-such as `v0.0.0.2` belong on the resulting master merge commit. GitHub Releases
+such as `v0.0.0.4` belong on the resulting master merge commit. GitHub Releases
 include the wheel and source distribution. Keep the versions in `pyproject.toml`
 and `src/vol5dkit/__init__.py` equal; the release workflow verifies them.
 

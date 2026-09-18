@@ -16,8 +16,8 @@ CPU/CUDA environment first; vol5dkit does not select a CUDA wheel index.
 Install the tagged release from GitHub:
 
 ```bash
-python -m pip install "vol5dkit @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.3"
-python -m pip install "vol5dkit[gui] @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.3"
+python -m pip install "vol5dkit @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.4"
+python -m pip install "vol5dkit[gui] @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.4"
 ```
 
 Use `[gui,colormaps]` to include Matplotlib and Seaborn colormaps.
@@ -93,6 +93,9 @@ open a new snapshot with another `view()` call.
 
 - The HW, SW, and SH panels show directly indexed slices, with spacing reflected
   in their aspect ratios. **Nearest** is the default; **linear** is opt-in.
+- Panel names use array row/column order. H increases downward in HW; S increases
+  upward in SW and SH. Only the 2D viewing direction changes; voxel values and
+  world coordinates are preserved.
 - Click or drag to move the linked crosshair. Scroll over a slice to move its
   perpendicular axis. Ctrl+wheel zooms; Shift+drag pans; **Fit** resets the view.
 - Choose an input from the toolbar or press **Tab**. **A/B** select the first two

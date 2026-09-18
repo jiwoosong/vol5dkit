@@ -329,6 +329,24 @@ def test_native_click_moves_one_shared_point_in_all_planes(application, viewer):
             assert torch.equal(plane.raw, expected_raw)
         assert all(line.visible for line in viewer.canvas._crosshairs.values())
 
+        # Verify the displayed crosshair and hover through the canvas transform,
+        # including the S-up coronal/sagittal cameras.
+        viewer.canvas.render()
+        line = viewer.canvas._crosshairs[name]
+        center = line.pos[[1, 2]].mean(axis=0)
+        point = line.get_transform(map_from="visual", map_to="canvas").map(center)
+        np.testing.assert_allclose(point[:2] / point[3], (position.x(), position.y()), atol=1)
+        event = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, QtCore.QPointF(position),
+            QtCore.QPointF(viewer.canvas.widget.mapToGlobal(position)),
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier,
+        )
+        QtWidgets.QApplication.sendEvent(viewer.canvas.widget, event)
+        assert f"SHW {(s, h, w)}" in viewer.status.text()
+        assert f"value {tensor[s, h, w].item()}" in viewer.status.text()
+        assert f"XYZ ({w * 0.5:g}, {h:g}, {s * 2:g})" in viewer.status.text()
+
 
 def test_drag_moves_crosshair_and_shift_drag_only_pans(application, viewer):
     widget = viewer.canvas.widget

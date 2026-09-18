@@ -148,6 +148,35 @@ def _sample(canvas, screenshot, name, column, row):
 
 
 @pytest.mark.gui
+@pytest.mark.parametrize("rgb", [False, True])
+def test_native_planes_screen_orientation_and_cursor_roundtrip(canvas, rgb):
+    s, h, w = torch.meshgrid(torch.arange(5), torch.arange(7), torch.arange(9), indexing="ij")
+    channels = torch.stack((s / 4, h / 6, w / 8))
+    tensor = channels[None] if rgb else (channels * torch.tensor((0.6, 0.25, 0.15))[:, None, None, None]).sum(0)[None, None]
+    volume = Volume(tensor, spacing=(3, 1.5, 0.75))
+    frame = prepare_frame(Request(1, 0, make_source(volume, rgb), (0, 0.5, 0.5, 0.5), window=(0, 1)))
+    canvas.set_frame(frame, mode_3d="hidden")
+    screenshot = canvas.render()
+
+    # Native array rows are H/S/S. On screen H grows down, while S grows up.
+    for name, rows, cols, top_row in (("HW", 7, 9, 0), ("SW", 5, 9, 4), ("SH", 5, 7, 4)):
+        first = _canvas_pos(canvas, name, 0.5, 0.5)
+        last = _canvas_pos(canvas, name, cols - 0.5, rows - 0.5)
+        assert first[0] < last[0]
+        assert (first[1] < last[1]) == (top_row == 0)
+        for row, col in ((0, 0), (0, cols - 1), (rows - 1, 0), (rows - 1, cols - 1)):
+            shw = {"HW": (2, row, col), "SW": (row, 3, col), "SH": (row, col, 4)}[name]
+            expected = tensor[(0, slice(None), *shw)].numpy() * 255
+            if not rgb:
+                expected = np.repeat(expected, 3)
+            np.testing.assert_allclose(_sample(canvas, screenshot, name, col + 0.5, row + 0.5), expected, atol=2)
+            position = _canvas_pos(canvas, name, col + 0.5, row + 0.5)
+            picked = canvas._cursor_position(SimpleNamespace(pos=position))
+            assert picked[0] == name
+            np.testing.assert_allclose(picked[1:], (row, col), atol=1e-6)
+
+
+@pytest.mark.gui
 def test_nearest_and_explicit_linear_rendering(canvas):
     tensor = torch.tensor([[[[[0., 1.], [1., 0.]], [[0., 1.], [1., 0.]]]]])
     canvas.set_frame(_frame(tensor), mode_3d="hidden")
@@ -291,20 +320,21 @@ def _mouse(canvas, event_type, pos, **kwargs):
 
 
 @pytest.mark.gui
-def test_left_selection_drag_and_shift_pan(canvas):
+@pytest.mark.parametrize("name", ["HW", "SW", "SH"])
+def test_left_selection_drag_and_shift_pan(canvas, name):
     from vispy.geometry import Rect
     from vispy.util import keys
-    canvas.set_frame(_frame(torch.zeros(1, 1, 4, 6, 8)))
+    canvas.set_frame(_frame(torch.zeros(1, 1, 5, 7, 9)))
     canvas.render()
     picked = []
     canvas._on_pick = lambda *args: picked.append(args)
-    start, end = _canvas_pos(canvas, "HW", 1.5, 1.5), _canvas_pos(canvas, "HW", 5.5, 4.5)
-    camera = canvas._views["HW"].camera
+    start, end = _canvas_pos(canvas, name, 1.5, 1.5), _canvas_pos(canvas, name, 5.5, 4.5)
+    camera = canvas._views[name].camera
     before = Rect(camera.rect)
     press = _mouse(canvas, "mouse_press", start, button=1, buttons=[1])
     move = _mouse(canvas, "mouse_move", end, button=1, buttons=[1], press_event=press, last_event=press)
     _mouse(canvas, "mouse_release", end, button=1, press_event=press, last_event=move)
-    assert all(p[0] == "HW" for p in picked)
+    assert all(p[0] == name for p in picked)
     np.testing.assert_allclose(picked[0][1:], (1, 1), atol=1e-6)
     np.testing.assert_allclose(picked[-1][1:], (4, 5), atol=1e-6)
     assert camera.rect == before
@@ -316,6 +346,8 @@ def test_left_selection_drag_and_shift_pan(canvas):
     assert not picked
     assert camera.rect != before
     np.testing.assert_allclose(camera.rect.size, before.size)
+    canvas.render()
+    np.testing.assert_allclose(_canvas_pos(canvas, name, 1.5, 1.5) - start, (20, 15), atol=1e-5)
     before = Rect(camera.rect)
     press = _mouse(canvas, "mouse_press", start, button=2, buttons=[2])
     move = _mouse(canvas, "mouse_move", start + (20, 15), button=2, buttons=[2], press_event=press, last_event=press)
