@@ -144,7 +144,10 @@ class VolumeCanvas:
             panel.add_widget(label, row=0, col=0)
             view = panel.add_view(row=1, col=0, border_color="#343b49")
             view.camera = scene.PanZoomCamera(aspect=1)
-            view.camera.flip = (False, True, False)
+            # H increases downward in HW; S increases upward in SW/SH.
+            # Keep native buffers and world transforms unchanged: only the
+            # 2D camera controls this display convention.
+            view.camera.flip = (False, name == "HW", False)
             self._views[name] = view
             self._labels[name] = label
             crosshair = scene.visuals.Line(

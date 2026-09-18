@@ -293,6 +293,20 @@ collapsible right panel contains sliders and numeric T/S/H/W controls, display
 settings, and 3D settings. It scrolls when window height is limited. The status
 area shows indices, world coordinates, original values, and processing state.
 
+Panel names use array row/column order; screen directions are:
+
+| Panel | Fixed axis | Left to right | Top to bottom |
+| --- | --- | --- | --- |
+| HW | S | W increases | H increases |
+| SW | H | W increases | S decreases |
+| SH | W | H increases | S decreases |
+
+For inputs whose W/H/S axes align with L/P/S, these are axial, coronal, and
+sagittal views, with superior at the top of the latter two. This is a display
+convention: the viewer does not reorient data or reslice an oblique grid into
+world-aligned planes. The 2D cameras set the viewing direction without changing
+native slice buffers, voxel values, or the slices' placement in 3D.
+
 - Left-click or drag moves the linked SHW crosshair. HW changes H/W, SW changes
   S/W, and SH changes S/H. Crosshair visibility is optional.
 - Wheel over a slice moves the perpendicular axis: HW → S, SW → H, SH → W.
