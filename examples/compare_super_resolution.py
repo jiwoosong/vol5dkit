@@ -3,7 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-import vol5dkit as v5
+import vol5dkit as v5d
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,16 +21,16 @@ def main():
          + 0.4 * torch.exp(-30 * ((x + 0.35) ** 2 + (y - shift) ** 2 + z**2))).clamp(0, 1)
         for shift in (0.0, 0.15)
     ]).unsqueeze(1)
-    a = v5.Volume(frames, spacing=(2.0, 1.0, 1.0), times=(0.0, 0.1))
+    a = v5d.Volume(frames, spacing=(2.0, 1.0, 1.0), times=(0.0, 0.1))
 
     # Interpolation baseline; the viewer still displays with nearest sampling.
     result = F.interpolate(a.tensor, scale_factor=2, mode="trilinear", align_corners=False)
     # Attach the original outer bounds and center without resampling again.
-    b = v5.Volume(result, ref=a)
+    b = v5d.Volume(result, ref=a)
 
-    viewer = v5.view(
-        v5.Display(a, name="Input"),
-        v5.Display(b, name="Upsampled"),
+    viewer = v5d.view(
+        v5d.Display(a, name="Input"),
+        v5d.Display(b, name="Upsampled"),
         window=(0, 1),
     )
     viewer.wait()

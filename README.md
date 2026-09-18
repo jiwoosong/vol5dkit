@@ -13,7 +13,15 @@ is **nearest** by default.
 Python 3.10+ and PyTorch 2.3+ are required. Install the PyTorch build for your
 CPU/CUDA environment first; vol5dkit does not select a CUDA wheel index.
 
-From a checkout:
+Install the tagged release from GitHub:
+
+```bash
+python -m pip install "vol5dkit @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.3"
+python -m pip install "vol5dkit[gui] @ git+https://github.com/jiwoosong/vol5dkit.git@v0.0.0.3"
+```
+
+Use `[gui,colormaps]` to include Matplotlib and Seaborn colormaps.
+From a local checkout:
 
 ```bash
 python -m pip install .                  # data core
@@ -21,28 +29,29 @@ python -m pip install ".[gui]"           # core and desktop viewer
 python -m pip install ".[gui,colormaps]" # also Matplotlib and Seaborn colormaps
 ```
 
-For a published PyPI release, use `vol5dkit`, `"vol5dkit[gui]"`, or
-`"vol5dkit[gui,colormaps]"` in place of the local path. The desktop viewer needs
-a local display and working OpenGL. Importing the package does not load Qt or
-VisPy into your Python process.
+The desktop viewer needs a local display and working OpenGL. Importing the
+package does not load Qt or VisPy into your Python process.
+
+On Ubuntu/Debian, the X11 (`xcb`) backend also requires system libraries,
+including `libxcb-cursor0`; see [Linux viewer troubleshooting](docs/usage.md#linux-viewer-troubleshooting).
 
 ## Compute, then compare
 
 ```python
 import torch
 import torch.nn.functional as F
-import vol5dkit as v5
+import vol5dkit as v5d
 
 # T = time, C = channels, S/H/W = spatial axes. CUDA tensors work too.
 x = torch.rand(2, 1, 32, 64, 64)
-a = v5.Volume(x, spacing=(2, 1, 1), times=(0.0, 0.1))
+a = v5d.Volume(x, spacing=(2, 1, 1), times=(0.0, 0.1))
 
 y = F.avg_pool3d(a.tensor, kernel_size=3, stride=1, padding=1)
-b = v5.Volume(y, ref=a)
+b = v5d.Volume(y, ref=a)
 
-viewer = v5.view(
-    v5.Display(a, name="original", window=(0, 1)),
-    v5.Display(b, name="filtered", window=(0, 1)),
+viewer = v5d.view(
+    v5d.Display(a, name="original", window=(0, 1)),
+    v5d.Display(b, name="filtered", window=(0, 1)),
 )
 viewer.wait()  # optional: wait for this window to close
 ```
@@ -55,11 +64,18 @@ automatic metadata propagation rules.
 `a`. A changed SHW size adjusts spacing and origin; it does not interpolate data.
 T must match. Use explicit coordinates for results with another spatial mapping.
 
+Device and memory changes return a new `Volume` with the same coordinates:
+
+```python
+cpu_result = b.detach().cpu()     # detach the graph, move to CPU if needed
+owned_result = b.detach().clone() # also own independent tensor storage
+```
+
 If coordinates and individual display options are unnecessary, pass native
 TCSHW tensors or NumPy arrays directly:
 
 ```python
-viewer = v5.view(x, y, window=(0, 1))
+viewer = v5d.view(x, y, window=(0, 1))
 ```
 
 `view()` accepts any number of inputs. `Display` adds optional `name`, `window`,
@@ -85,7 +101,7 @@ open a new snapshot with another `view()` call.
   **Share window** links scalar ranges; **Auto** uses the current input's range.
 - **Planes**, **Volume**, and **Off** control the 3D panel. Volume rendering uses
   every voxel; its opacity control defaults to 0.15.
-- RGB is explicit: `v5.Display(color, rgb=True)` requires C=3. Scalar maps include
+- RGB is explicit: `v5d.Display(color, rgb=True)` requires C=3. Scalar maps include
   `vispy:hot`; the optional colormaps extra adds `mpl:hot` and `sns:rocket`.
 
 Names and axes are generic: units, world basis, and channel meaning belong to
@@ -93,7 +109,7 @@ your application. The viewer does not perform registration or infer anatomy.
 
 ## More
 
-- [Usage](docs/usage.md): coordinates, ownership, display options, and debuggers.
+- [Usage](docs/usage.md): coordinates, tensor state, array exchange, and viewing.
 - [Denoising example](examples/compare_denoising.py) and
   [resolution comparison](examples/compare_super_resolution.py): edit the device
   variable at the top, then run the script.

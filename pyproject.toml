@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vol5dkit"
-version = "0.0.0.2"
+version = "0.0.0.3"
 description = "Lightweight TCSHW tensor geometry and native-slice volume comparison"
 readme = "README.md"
 requires-python = ">=3.10"

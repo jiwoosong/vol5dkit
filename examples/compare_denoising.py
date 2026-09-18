@@ -3,7 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-import vol5dkit as v5
+import vol5dkit as v5d
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -23,17 +23,17 @@ def main():
         for shift in (0.0, 0.15)
     ]).unsqueeze(1)
     noisy = (clean + 0.1 * torch.randn_like(clean)).clamp(0, 1)
-    a = v5.Volume(noisy, spacing=(2.0, 1.0, 1.0), times=(0.0, 0.1))
+    a = v5d.Volume(noisy, spacing=(2.0, 1.0, 1.0), times=(0.0, 0.1))
 
     # T is the batch dimension for avg_pool3d; C is preserved.
     padded = F.pad(a.tensor, (1, 1, 1, 1, 1, 1), mode="replicate")
     result = F.avg_pool3d(padded, kernel_size=3, stride=1)
-    b = v5.Volume(result, ref=a)
-    residual = v5.Volume(result - noisy, ref=a)
-    viewer = v5.view(
-        v5.Display(a, name="Noisy", window=(0, 1)),
-        v5.Display(b, name="Denoised", window=(0, 1)),
-        v5.Display(residual, name="Residual", window=(-0.2, 0.2), cmap="vispy:coolwarm"),
+    b = v5d.Volume(result, ref=a)
+    residual = v5d.Volume(result - noisy, ref=a)
+    viewer = v5d.view(
+        v5d.Display(a, name="Noisy", window=(0, 1)),
+        v5d.Display(b, name="Denoised", window=(0, 1)),
+        v5d.Display(residual, name="Residual", window=(-0.2, 0.2), cmap="vispy:coolwarm"),
     )
     viewer.wait()
 

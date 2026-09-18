@@ -21,15 +21,22 @@ The actual breakpoint integration test also needs `debugpy>=1.8.20`. CUDA,
 GUI, optional-colormap, debugger, and adapter cases skip if their requirements
 are unavailable. The core and display-data tests do not need GUI imports.
 
+With CuPy installed for your CUDA environment, run
+`python -m pytest -q tests/test_volume.py -k cupy` to check DLPack storage sharing,
+coordinates, and stream interoperability. CuPy remains an optional test dependency.
+
 Core tests cover ownership, autograd, geometry, subclass behavior, and validation
 reuse. Viewer tests cover exact range calculations, raw-value buffers, rendering,
 per-input settings, stale worker results, 3D buffer reuse, and snapshot/process
 cleanup. The debugpy test evaluates public `view()` at a real breakpoint and
 checks rendering and navigation before allowing the parent to resume.
 
-CI checks Linux/Windows core environments, minimum Torch 2.3 compatibility,
-GUI rendering under Xvfb/Mesa, and wheel/source distributions. Tests should
-check behavior and ownership; timing ratios are not CI pass/fail thresholds.
+CI covers Python 3.10–3.13 on Linux, Python 3.11 on Windows, minimum Torch 2.3
+compatibility, and GUI rendering under Xvfb/Mesa. Distribution checks build a
+wheel from the sdist, install it in a fresh environment, and run
+`tests/smoke_installed.py` outside the checkout with `PYTHONPATH` unset and
+Python's `-I` flag. Tests should check behavior and ownership; timing ratios
+are not CI pass/fail thresholds.
 
 ## Examples and benchmarks
 
